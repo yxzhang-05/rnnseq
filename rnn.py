@@ -279,7 +279,7 @@ if __name__ == "__main__":
 		n_layers = 1, # number of RNN layers
 		n_latent = 10, # size of latent layer (autoencoder only!!)
 		m = 2, # number of unique letters in each sequence
-		task = 'RNNPred',  # choose btw 'RNNPred', 'RNNClass', RNNAuto', or 'RNNMulti'
+		task = 'RNNAuto',  # choose btw 'RNNPred', 'RNNClass', RNNAuto', or 'RNNMulti'
 		k_steps=None,	# number of steps for the k-steps rollout (prediction only)
 		k_steps_scheduling=True,
 		objective = 'CE', # choose btw cross entr (CE) and mean sq error (MSE)

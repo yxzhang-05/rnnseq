@@ -318,7 +318,7 @@ class RNN (nn.Module):
             torch.manual_seed(1990+seed)
 
         if init == None:
-            pass
+            return
         elif init == "Rich":
             # initialisation of the weights -- N(0, 1/n)
             init_f = lambda f_in: 1./f_in
@@ -333,11 +333,11 @@ class RNN (nn.Module):
                 f"Invalid init option '{init}'\n" + \
                  "Choose either None, 'Rich', 'Lazy' or 'Const'")
         
-        if init is not None:
-            if "weight" in name:
-                f_in = 1.*pars.data.size()[1]
+        for name, param in self.named_parameters():
+            if "weight" in name and param.requires_grad:
+                f_in = param.data.size(1)  # fan-in
                 std = init_f(f_in)
-                pars.data.normal_(0., std)
+                param.data.normal_(0., std)
 
     def __hidden_update (self, h, x):
         '''
@@ -552,49 +552,6 @@ class RNNAutoencoder(nn.Module):
         reconstructed = self.decoder(latent, delay=0)
 
         return hidden, latent, reconstructed
-
-class RNNMulti (nn.Module):
-    def __init__(self, d_input, d_hidden, num_layers, d_latent, num_classes, sequence_length, device="cpu", model_filename=None, from_file=[], to_freeze=[], init_weights=None, layer_type=nn.Linear):
-        super(RNNMulti, self).__init__()
-        self.rnn = RNN(d_input, d_hidden, num_layers, d_latent)
-        self.out_class = nn.Linear(d_hidden, num_classes)
-        self.out_pred = nn.Linear(d_hidden, d_input)
-        self.out_auto = RNNDecoder(d_latent, d_hidden, d_input, num_layers, sequence_length)
-        self.device = device
-        self.task = None
-
-    @property
-    def h2h (self):
-        return self.rnn.h2h
-
-    def set_task(self, task):
-        self.task = task
-
-    def forward(self, x, mask=None, delay=0):
-
-        hidden, output = self.rnn(x, mask=mask, delay=delay)
-
-        if self.task == 'RNNClass':
-            output = self.out_class(hidden)
-            return hidden, output
-        elif self.task == 'RNNPred':
-            output = self.out_pred(hidden)
-            return hidden, output
-        elif self.task == 'RNNAuto':
-            latent = output[-1]
-            output = self.out_auto(latent, delay=0)
-            return hidden, latent, output
-        else:
-            raise ValueError(f"Invalid task: {self.task}")
-
-    def save(self, filename):
-        torch.save(self.state_dict(), filename)
-
-    def load(self, filename):
-        self.load_state_dict(torch.load(filename, map_location=self.device))
-
-    def __len__ (self):
-        return len(self._modules.items())
 
 
 

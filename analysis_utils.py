@@ -1,19 +1,9 @@
 import numpy as np
-from numpy import loadtxt
 import matplotlib.pyplot as plt
-import string
-import torch
-from matplotlib import rc
-from pylab import rcParams
-import sys
-import os
-from os.path import join
-import pickle
-import par
+import par_transfer as par
 import scipy.cluster.hierarchy as sch
 from itertools import combinations
 from collections import defaultdict
-from mpl_toolkits.axes_grid1 import make_axes_locatable
 
 ######################################################
 # Dot product of the representations in hidden layer #
@@ -135,109 +125,6 @@ def compute_umcontent(M, return_triplets=True):
     return np.nanmean(lamda_combos, axis=1)
 
 
-def plot_triplets_sorted(delta1_t, delta2_t, lamda_t, filename):
-    fig, ax = plt.subplots(1, (par.cue_size+par.L+par.delay), figsize=[14, 2])
-    ax = ax.ravel()
-
-    for idx_t in range(par.cue_size+par.L+par.delay):
-        notmask = np.where(delta1_t[idx_t] != -99)
-
-        x=np.arange(0.0,1.1,0.1)
-        ax[idx_t].plot(x, x, alpha=1, color='white', lw=1.5, zorder=2)
-        ax[idx_t].plot(x, 1.-x, alpha=1, color='white', lw=1.5, zorder=2)
-        im = ax[idx_t].hexbin(np.append(x, delta2_t[idx_t, notmask]), np.append(x, delta1_t[idx_t, notmask]), gridsize=50)
-        ax[idx_t].set_xlabel('dmed/dmax') 
-        ax[idx_t].set_ylabel('dmin/dmax')
-        ax[idx_t].set_title('uc = %.2f'%np.nanmean(lamda_t[idx_t, notmask]))
-        ax[idx_t].set_xlim(0.5,1)
-        ax[idx_t].set_ylim(0.,1)
-
-    fig.tight_layout()
-    fig.colorbar(im, ax=ax.ravel().tolist(), fraction=0.046, pad=0.04)
-    fig.savefig(f"{par.folder}/figs/umcontent_{filename}.svg", bbox_inches="tight", dpi=600)
-
-def compute_overlap(M, tokens, types):
-
-    n_set=len(tokens)
-    tokens = np.array([list(token) for token in tokens])
-
-    M_t = np.ndarray((par.cue_size+par.L+par.delay, n_set, n_set))
-    sorted_idx_t =  np.ndarray((par.cue_size+par.L+par.delay, n_set))
-    sorted_ticklabels_t =  np.empty((par.cue_size+par.L+par.delay, n_set), dtype=object)
-    
-    for idx_t in range(par.L):
-
-        if idx_t < par.L:
-            T=idx_t
-        else:
-            T=par.L-1
-        
-        if par.clustering == 'class':
-            idx = np.arange(len(tokens))
-            ticklabels = np.array(types).astype(int)
-
-        elif par.clustering == 'timestep':
-            idx = np.argsort(tokens[:,T])
-            tokens_sorted=tokens[idx]
-            ticklabels=["".join(token) for token in tokens_sorted[:,:T+1].astype(str)]  
-
-        elif par.clustering == 'hierarchical':
-            idx = np.lexsort(tokens.T[::-1])
-            tokens_sorted=tokens[idx]
-            ticklabels=["".join(token) for token in tokens_sorted[:,:T+1].astype(str)]  
-
-        elif par.clustering == 'transitions':
-            if idx_t == 0:
-                tokens_ = tokens[:,idx_t].reshape(-1,1)
-            else:
-                tokens_ = tokens[:,idx_t-1:idx_t+1]
-            idx = np.lexsort(tokens_.T[::-1])
-            tokens_sorted=tokens_[idx]
-            ticklabels=["".join(token) for token in tokens_sorted]
-
-        elif par.clustering == 'distance':
-            pairwise_distances = sch.distance.pdist(M)
-            linkage = sch.linkage(pairwise_distances, method='complete')
-            cluster_distance_threshold = pairwise_distances.max()/2
-            idx_to_cluster_array = sch.fcluster(linkage, cluster_distance_threshold, criterion='distance')
-            idx = np.argsort(idx_to_cluster_array)
-            tokens_sorted=tokens[idx]
-            ticklabels=["".join(token) for token in tokens_sorted[:,:T+1].astype(str)]  
-
-        M_sorted = M[idx_t].copy()
-        M_sorted = np.take(M_sorted, idx, axis=0) 
-        M_sorted = np.take(M_sorted, idx, axis=1)
-
-        M_t[idx_t] = M_sorted
-        sorted_idx_t[idx_t] = idx
-        sorted_ticklabels_t[idx_t] = ticklabels
-    
-    for idx_t in range(par.L, par.cue_size+par.L+par.delay):
-        M_sorted = M[idx_t].copy()
-        M_sorted = np.take(M_sorted, idx, axis=0) 
-        M_sorted = np.take(M_sorted, idx, axis=1)
-
-        M_t[idx_t] = M_sorted
-        sorted_idx_t[idx_t] = idx
-        sorted_ticklabels_t[idx_t] = ticklabels
-
-    return M_t, sorted_ticklabels_t
-
-
-def plot_overlap_sorted(M_sorted, ticklabels, filename, task):
-    fig, ax = plt.subplots(2, (par.cue_size+par.L+par.delay)//2, figsize=[10, 4])
-    ax = ax.ravel()
-    for idx_t in range(par.cue_size+par.L+par.delay):
-        im=ax[idx_t].imshow(M_sorted[idx_t])        
-        ax[idx_t].tick_params(top=True, labeltop=True, bottom=False, labelbottom=False) 
-        ax[idx_t].set_xticks([])#np.arange(len(ticklabels[idx_t])))
-        ax[idx_t].set_xticklabels([])#ticklabels[idx_t], rotation=60, size=4)            
-        ax[idx_t].set_yticks([])#np.arange(len(ticklabels[idx_t])))
-        ax[idx_t].set_yticklabels([])#ticklabels[idx_t], size=4)
-        ax[idx_t].tick_params(top=True, labeltop=True, bottom=False, labelbottom=False)
-    fig.colorbar(im, ax=ax.ravel().tolist(), fraction=0.046, pad=0.04)
-    fig.savefig(f"{par.folder}/figs/{whichmatrix}_{filename}_whichclustering{par.clustering}_{par.whichset}_task{task}.svg", bbox_inches="tight", dpi=600)
-
 def compute_overlap_AE(M, tokens, types):
     n_set=len(tokens)
     tokens = np.array([list(token) for token in tokens])
@@ -250,10 +137,10 @@ def compute_overlap_AE(M, tokens, types):
         
         if par.clustering == 'class':
             idx = np.arange(len(tokens))
-            ticklabels = np.array(types).astype(int)
+            ticklabels = np.array(types)
 
         elif par.clustering == 'hierarchical':
-            idx = np.lexsort(tokens.T[::-1])
+            idx = np.lexsort([tokens[:, i] for i in range(tokens.shape[1]-1, -1, -1)])
             tokens_sorted=tokens[idx]
             ticklabels=["".join(token) for token in tokens_sorted.astype(str)]  
 
@@ -278,7 +165,7 @@ def compute_overlap_AE(M, tokens, types):
                 tokens = tokens[:,idx_t-1:idx_t+1]
             idx = np.lexsort(tokens.T[::-1])
             tokens_sorted=tokens[idx]
-            ticklabels=["".join(token) for token in tokens_sorted[:,:T+1].astype(str)]  
+            ticklabels=["".join(token) for token in tokens_sorted[:,:tokens.shape[1]].astype(str)]  
 
         M_sorted = np.take(M, idx, axis=0)
         M_sorted = np.take(M_sorted, idx, axis=1)
@@ -288,7 +175,7 @@ def compute_overlap_AE(M, tokens, types):
 
     return M_t, sorted_ticklabels_t
 
-def plot_overlap_AE(M_t, ticklabels_t, filename, task):
+def plot_overlap_AE(M_t, ticklabels_t, filename, task, whichmatrix='overlap'):
     fig, ax = plt.subplots(1, par.L, figsize=[10, 2.5])
     ax = ax.ravel()
 

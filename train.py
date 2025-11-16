@@ -3,6 +3,11 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from itertools import product
+from model import RNN, LowRankLinear, FullRankLinear
+from torch.optim import Adam
+import matplotlib.pyplot as plt
+import os
+from os.path import join
 
 loss_functions = {
 	'RNNPred': {
@@ -308,90 +313,80 @@ def predict(alpha, model, letter_to_index, index_to_letter, seq_start, len_next_
 	return seq_start
 
 
+def generate_sequences(N: int, L: int):
+	sequences = []
+	pairs = [(a, b) for a, b in product(range(N), repeat=2) if a != b]
+	
+	for a, b in pairs:
+		# Pattern 1: ABABAB...
+		seq1 = [a if i % 2 == 0 else b for i in range(L)]
+		
+		# Pattern 2: AABBAABB...
+		seq2 = [a if (i // 2) % 2 == 0 else b for i in range(L)]
+
+		# Pattern 3: AAABBBAA...
+		seq3 = [a if (i // 3) % 2 == 0 else b for i in range(L)]
+		
+		sequences.append(seq1)
+		sequences.append(seq2)
+		sequences.append(seq3)
+
+	sequences = torch.Tensor(sequences).to(torch.int64).T
+	# print(sequences)
+	# exit()
+
+	return F.one_hot(sequences, num_classes=N).to(torch.float)
+
+
+def run_experiment(L, d_input, k_steps, n_epochs, model=None, n_snaps=100, **rnn_kwargs):
+
+	# model and optimizer
+	d_hidden = 64
+	num_layers = 1
+	d_output = d_input
+	if model is None:
+		model = RNN(d_input, d_hidden, num_layers, d_output, **rnn_kwargs)
+	elif not isinstance(model, RNN):
+		raise ValueError("`model` can only be None or RNN")
+	optimizer = Adam(
+			model.parameters(),	# to check if model.parameters() gives all and only the parameters we want
+			lr=0.001, weight_decay=0.)
+
+	# training dataset
+	X = generate_sequences(d_input, L)
+
+	# set up loss function
+	loss_function = lambda output, target: F.nll_loss(F.log_softmax(output, dim=-1).view(-1, output.shape[-1]), \
+										torch.argmax(target,dim=-1).view(-1), reduction="mean")
+	# loss_function = F.cross_entropy
+
+	X_input, X_target = X[:-1], X[1:]
+
+	losses = []
+	for ep in range(n_epochs + 1):
+		optimizer.zero_grad()
+		if not k_steps: # 0 or None
+			if not ep:
+				print("Using standard next-token CE")
+			_, output = model.forward(X_input)
+			loss = loss_function(output, X_target)
+		elif isinstance(k_steps, int) and (k_steps > 0):
+			if not ep:
+				print("Using k-steps rollout CE")
+			loss = compute_k_steps_rollout_loss(model, X_input, X_target,
+						k_steps=k_steps, loss_function=loss_function)
+
+		losses.append(loss.item())
+		if not ep % n_snaps:
+			print(f"{str(ep):<6}", losses[-1])
+
+		loss.backward()
+		optimizer.step()
+
+	return model, losses
+
 
 if __name__ == "__main__":
-
-	from model import RNN, LowRankLinear, FullRankLinear
-	from torch.optim import Adam
-	import matplotlib.pyplot as plt
-	import os
-	from os.path import join
-
-
-	def generate_sequences(N: int, L: int):
-	    sequences = []
-	    pairs = [(a, b) for a, b in product(range(N), repeat=2) if a != b]
-	    
-	    for a, b in pairs:
-	        # Pattern 1: ABABAB...
-	        seq1 = [a if i % 2 == 0 else b for i in range(L)]
-	        
-	        # Pattern 2: AABBAABB...
-	        seq2 = [a if (i // 2) % 2 == 0 else b for i in range(L)]
-
-	        # Pattern 3: AAABBBAA...
-	        seq3 = [a if (i // 3) % 2 == 0 else b for i in range(L)]
-	        
-	        sequences.append(seq1)
-	        sequences.append(seq2)
-	        sequences.append(seq3)
-
-	    sequences = torch.Tensor(sequences).to(torch.int64).T
-	    # print(sequences)
-	    # exit()
-
-	    return F.one_hot(sequences, num_classes=N).to(torch.float)
-
-
-	def run_experiment(L, d_input, k_steps, n_epochs, model=None, n_snaps=100, **rnn_kwargs):
-
-		# model and optimizer
-		d_hidden = 64
-		num_layers = 1
-		d_output = d_input
-		if model is None:
-			model = RNN(d_input, d_hidden, num_layers, d_output, **rnn_kwargs)
-		elif not isinstance(model, RNN):
-			raise ValueError("`model` can only be None or RNN")
-		optimizer = Adam(
-				model.parameters(),	# to check if model.parameters() gives all and only the parameters we want
-				lr=0.001, weight_decay=0.)
-
-		# training dataset
-		X = generate_sequences(d_input, L)
-
-		# set up loss function
-		loss_function = lambda output, target: F.nll_loss(F.log_softmax(output, dim=-1).view(-1, output.shape[-1]), \
-		                                 torch.argmax(target,dim=-1).view(-1), reduction="mean")
-		# loss_function = F.cross_entropy
-
-		X_input, X_target = X[:-1], X[1:]
-
-		losses = []
-		for ep in range(n_epochs + 1):
-			optimizer.zero_grad()
-			if not k_steps: # 0 or None
-				if not ep:
-					print("Using standard next-token CE")
-				_, output = model.forward(X_input)
-				loss = loss_function(output, X_target)
-			elif isinstance(k_steps, int) and (k_steps > 0):
-				if not ep:
-					print("Using k-steps rollout CE")
-				loss = compute_k_steps_rollout_loss(model, X_input, X_target,
-							k_steps=k_steps, loss_function=loss_function)
-
-			losses.append(loss.item())
-			if not ep % n_snaps:
-				print(f"{str(ep):<6}", losses[-1])
-
-			loss.backward()
-			optimizer.step()
-
-
-		return model, losses
-
-
 
 	L=6
 	d_input = 4

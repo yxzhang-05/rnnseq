@@ -2,6 +2,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import string
+from sklearn import metrics
 from pprint import pprint
 import itertools
 from sklearn.cluster import KMeans

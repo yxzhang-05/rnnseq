@@ -6,7 +6,7 @@ import os
 import sys
 from os.path import join
 from glob import glob
-# import par_transfer as par
+import par_transfer as par
 import par
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -14,15 +14,12 @@ import pickle
 # from make_data import make_data
 from sklearn.decomposition import PCA
 from collections import defaultdict
-from colorstrings import CYAN_STR, RED_STR, END_STR
 from lowrank_utils import * #plot_mean_loss, align_singular_vectors, plot_SVD_results, plot_SVDs_dimensionality_all, plot_recurrent_weights, plot_all_weights, dimension, compute_umcontent, compute_cosine_similarity, compute_distance, to_dict
 
 
-folder_name = join(f'Task{par.task}_N{par.n_hidden}_nlatent{par.n_latent}_L{par.L}_m{par.m}_alpha{par.alpha}'+\
+folder_name = join(f'Task{par.task}_N{par.n_hidden}_nlatent{par.n_latent}_kSteps{par.k_steps}_L{par.L}_m{par.m}_alpha{par.alpha}'+\
                    f'_nepochs{par.n_epochs}_ntypes{par.n_types}_fractrain{par.frac_train:.1f}_obj{par.loss}'+\
-                   # f'_nepochs{par.n_epochs}_ntypes{par.n_types}_fractrain{par.frac_train:.1f}_obj{par.loss}_'+\
-                   f'_init{par.init}_transfer{par.transfer}_cuesize{par.cue_size}_delay{par.delay}_datasplit{par.datasplit}_noise{par.train_noise:.3f}'
-                   
+                   f'_init{par.init}_transfer{par.transfer}_cuesize{par.cue_size}_delay{par.delay}_datasplit{par.datasplit}max_rank{par.rank}'                  
                   )
 
 DATA_DIR = join(par.folder, folder_name)
@@ -50,8 +47,7 @@ def get_all_sims_paths (folder_name):
     """
     Get all simulation paths for a given folder name.
     """
-    model_paths = sorted(glob(join(DATA_DIR, f'model_state_classcomb{par.classcomb}_sim*.pth')))
-    # model_paths = sorted(glob(join(DATA_DIR, f'model_state_classcomb{par.classcomb}_sim*.pth')))
+    model_paths = sorted(glob(join(DATA_DIR, f'model_state_classcomb{par.classcomb}.pth')))
     results_paths = sorted(glob(join(DATA_DIR, f'results_task{par.task}_classcomb{par.classcomb}_sim*.pkl')))
     return model_paths, results_paths
 
@@ -70,7 +66,7 @@ all_models = [torch.load(path, map_location="cpu") for path in model_paths]
 all_results = [pickle.load(open(path, 'rb')) for path in results_paths]
 
 assert len(all_results) and len(all_models), "Empty results..."
-assert len(all_results) == len(all_models), f"Length mismatch betwen results and models, {len(all_results)} vs {len(all_models)}"
+# assert len(all_results) == len(all_models), f"Length mismatch betwen results and models, {len(all_results)} vs {len(all_models)}"
 
 FIGS_DIR = join(par.folder, 'figs', folder_name)
 # FIGS_DIR = join(par.folder, 'figs', folder_name, f"classcomb_{par.classcomb}", f"{par.whichset}", f"svg_{par.common_rotation}")

@@ -6,12 +6,10 @@ import os
 import sys
 from os.path import join
 from glob import glob
-# import par_transfer as par
-import par
+import par_transfer as par
 import matplotlib.pyplot as plt
 import seaborn as sns
 import pickle
-# from make_data import make_data
 from sklearn.decomposition import PCA
 from collections import defaultdict
 from colorstrings import CYAN_STR, RED_STR, END_STR
@@ -230,7 +228,7 @@ def plot_SVDs_recurrent_weights(all_rec_weights, all_rec_weights_proj, FIGS_DIR)
     ax.fill_between(np.arange(n_components)+1,
                     np.percentile(all_rec_S,5,axis=0)[:n_components],
                     np.percentile(all_rec_S,95,axis=0)[:n_components],
-                    ls='--', color='b', lw=0, alpha=.2, label='av S orig')
+                    color='b', lw=0, alpha=.2, label='av S orig')
     # ax.plot(np.arange(n_components)+1, np.mean(all_rec_S_proj,axis=0)[:n_components], ls=':', c='r', lw=2, label='av S rot')
     S_mean = np.linalg.svd(np.mean(all_rec_weights, axis=0), compute_uv=False)
     S_mean_proj = np.linalg.svd(np.mean(all_rec_weights_proj, axis=0), compute_uv=False)
@@ -244,6 +242,7 @@ def plot_SVDs_recurrent_weights(all_rec_weights, all_rec_weights_proj, FIGS_DIR)
     fig.tight_layout()
     fig.savefig(join(FIGS_DIR, f'SVDs_recurrent_weights.svg'), dpi=300)
     plt.close(fig)
+
 
 def plot_recurrent_weights(all_rec_weights, all_rec_weights_proj, FIGS_DIR):
 
