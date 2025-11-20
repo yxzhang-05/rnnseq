@@ -142,11 +142,6 @@ def main(
 						model_filename=model_filename, from_file=from_file,
 						to_freeze=to_freeze, init_weights=init_weights, layer_type=layer_type)
 		
-		elif task == 'RNNMulti':
-			model = RNNMulti(alpha, n_hidden, n_layers, n_latent, num_classes, L+cue_size,
-						device=device, model_filename=model_filename, from_file=from_file,
-						to_freeze=to_freeze, init_weights=init_weights, layer_type=layer_type)
-
 		else:
 			raise ValueError(f"Model not recognized: {task}")
 

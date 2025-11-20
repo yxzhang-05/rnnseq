@@ -482,34 +482,32 @@ class RNNEncoder(nn.Module):
 
 class RNNDecoder(nn.Module):
     def __init__(self, d_latent, d_hidden, num_layers, d_input, nonlinearity, device,
-            init_weights, layer_type, sequence_length):
+                 init_weights, layer_type, sequence_length):
         super(RNNDecoder, self).__init__()
-        # RNN: d_latent -> d_input
-
-        self.rnn = RNN(d_latent, d_hidden, num_layers, d_input, nonlinearity=nonlinearity, device=device,
-            init_weights=init_weights, layer_type=layer_type)
-        
+        self.rnn = RNN(d_latent, d_hidden, num_layers, d_input, nonlinearity=nonlinearity,
+                       device=device, init_weights=init_weights, layer_type=layer_type)
         self.sequence_length = sequence_length
+        self.device = device
 
     def forward(self, latent, delay=0):
-        '''
-        latent is either
-        - (batch_dim, d_latent)
-        or
-        - (d_latent,)
-        '''
-        # repeat latent vector as many as sequence length
-        latent_expanded = latent.unsqueeze(0).expand(self.sequence_length, *[-1] * latent.dim())
+        """
+        latent: (batch, d_latent) or (d_latent,)
+        """
+        # 如果 latent 是一维，扩展 batch 维
+        if latent.dim() == 1:
+            latent = latent.unsqueeze(0)
 
-        # Expand the latent vector to match the sequence length, fill with zeros
-        # filled_tensor = torch.zeros_like(latent_expanded)
-        # filled_tensor[0,:] = latent
+        batch_size = latent.shape[0]
 
-        rnn_out, output = self.rnn(latent_expanded, delay=0)
+        # repeat latent as sequence input
+        decoder_input = latent.unsqueeze(0).expand(self.sequence_length, batch_size, -1)
+
+        # forward
+        rnn_out, output = self.rnn(decoder_input, delay=delay)
         return output
 
 class RNNAutoencoder(nn.Module):
-    def __init__(self, d_input, d_hidden, num_layers, d_latent, sequence_length,
+    def __init__(self, d_input, d_emb, d_hidden, num_layers, d_latent, sequence_length,
                         nonlinearity='relu',
                         device="cpu",
                         model_filename=None, # file with model parameters
@@ -527,12 +525,16 @@ class RNNAutoencoder(nn.Module):
         self.sequence_length = sequence_length
         self.device = device
 
-        self.encoder = RNNEncoder(d_input, d_hidden, num_layers, d_latent, nonlinearity, device,
+        self.embedding = nn.Embedding(num_embeddings=d_input, embedding_dim=d_emb)
+        
+        self.encoder = RNNEncoder(d_emb, d_hidden, num_layers, d_latent, nonlinearity, device,
             model_filename, from_file, to_freeze, init_weights, layer_type)
 
-        self.decoder = RNNDecoder(d_latent, d_hidden, num_layers, d_input, nonlinearity, device,
+        self.decoder = RNNDecoder(d_latent, d_hidden, num_layers, d_emb, nonlinearity, device,
             init_weights=init_weights, layer_type=layer_type, sequence_length=sequence_length)
 
+        self.out_proj = nn.Linear(d_emb, d_input)
+        
     @property
     def h2h (self):
         return self.encoder.rnn.h2h
@@ -547,11 +549,14 @@ class RNNAutoencoder(nn.Module):
             _masking = lambda h: h * mask[None,:]
         else:
             _masking = lambda h: h
+            
+        x_emb = self.embedding(x.long())             # (seq_len, batch, d_emb)
+        hidden, latent = self.encoder(x_emb, delay=self.delay)   # 用 embedding 作为 encoder 输入
 
-        hidden, latent = self.encoder(x, delay=self.delay)
-        reconstructed = self.decoder(latent, delay=0)
+        dec_emb = self.decoder(latent, delay=0)      # (seq_len, batch, d_emb)
+        logits = self.out_proj(dec_emb)              # (seq_len, batch, d_input) —— token logits
 
-        return hidden, latent, reconstructed
+        return hidden, latent, logits
 
 
 
