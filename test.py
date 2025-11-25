@@ -16,15 +16,15 @@ import os
 # =====================================
 ENABLE_SERIALIZE_Z = True
 ENABLE_CONTRASTIVE = True      
-CONTRASTIVE_WEIGHT = 7   
+CONTRASTIVE_WEIGHT = 2.5   
 # =====================================
 
 seed = 42
-L, m, alpha = 5, 3, 8
-epochs = 400  
-lr = 3e-3
-d_hidden = 128
-d_latent = 32  
+L, m, alpha = 4, 2, 6
+epochs = 1000 
+lr = 1e-3
+d_hidden = 32
+d_latent = 8  
 weight_decay = 1e-3 
 num_layers = 1
 device = torch.device('cpu')
@@ -38,23 +38,33 @@ def set_seed(seed):
 
 def generate_instances(alpha, L, m, frac_train=0.8):
     alphabet = list(string.ascii_lowercase[:alpha])
-    types_nested = findStructures(alphabet, L, m)
-    types = [t for sub in types_nested for t in sub]
-
+    types = sum(findStructures(alphabet, L, m), [])  # flatten
     all_perms = list(itertools.permutations(alphabet, m))
-    seqs = []
-    labels = []
-    for type_idx, t in enumerate(types):
-        for perm in all_perms:
-            seqs.append(seq_replace_symbols(t, perm))
-            labels.append(type_idx)
 
-    seqs = np.array(seqs)
-    labels = np.array(labels)
-    N = len(seqs)
-    idx = np.random.permutation(N)
-    split = int(N * frac_train)
-    return seqs[idx[:split]], seqs[idx[split:]], labels[idx[:split]], labels[idx[split:]], types
+    train_seqs, test_seqs = [], []
+    train_labels, test_labels = [], []
+
+    for type_idx, t in enumerate(types):
+        # generate sequences for this type
+        seqs = [seq_replace_symbols(t, perm) for perm in all_perms]
+
+        # shuffle and split
+        n = len(seqs)
+        perm_idx = np.random.permutation(n)
+        split = int(frac_train * n)
+
+        train_idx = perm_idx[:split]
+        test_idx  = perm_idx[split:]
+
+        # append train
+        train_seqs.extend([seqs[i] for i in train_idx])
+        train_labels.extend([type_idx] * len(train_idx))
+
+        # append test
+        test_seqs.extend([seqs[i] for i in test_idx])
+        test_labels.extend([type_idx] * len(test_idx))
+
+    return (np.array(train_seqs), np.array(test_seqs), np.array(train_labels), np.array(test_labels), types,)
 
 
 def sequences_to_tensor(sequences, alpha):
@@ -71,7 +81,7 @@ def sequences_to_tensor(sequences, alpha):
     return one_hot.permute(1, 0, 2)
 
 
-def contrastive_loss(latent, X_batch, temperature=0.5):
+def contrastive_loss(latent, X_batch):
    
     L, B, alpha = X_batch.shape
     
@@ -94,7 +104,7 @@ def contrastive_loss(latent, X_batch, temperature=0.5):
     relation_sim = relation_sim / (norm @ norm.T + 1e-8)
 
     latents_norm = F.normalize(latent, p=2, dim=1)
-    latent_sim = torch.matmul(latents_norm, latents_norm.T) / temperature
+    latent_sim = torch.matmul(latents_norm, latents_norm.T) / 0.5
     
     exp_sim = torch.exp(latent_sim)
     weighted_positive = (exp_sim * relation_sim).sum(dim=1)
@@ -106,7 +116,6 @@ def contrastive_loss(latent, X_batch, temperature=0.5):
     return loss
 
 
-
 def train(model, X_train, X_test, test_labels,
                                n_epochs=300, lr=0.001, weight_decay=0,
                                use_contrastive=True, contrastive_weight=0.5):
@@ -114,10 +123,7 @@ def train(model, X_train, X_test, test_labels,
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
 
     history = {k: [] for k in ['train_loss', 'ce_loss', 'contrastive_loss', 'test_loss',
-                               'train_token_acc', 'test_token_acc',
                                'train_seq_acc', 'test_seq_acc', 'silhouette']}
-
-    alpha = X_train.shape[2]
  
     for epoch in range(n_epochs):
         model.train()
@@ -134,7 +140,7 @@ def train(model, X_train, X_test, test_labels,
 
         contrast_loss = torch.tensor(0.0)
         if use_contrastive:
-            contrast_loss = contrastive_loss(latent, X_batch, temperature=0.5)
+            contrast_loss = contrastive_loss(latent, X_batch)
             total_loss = total_loss + contrastive_weight * contrast_loss
 
         total_loss.backward()
@@ -145,7 +151,6 @@ def train(model, X_train, X_test, test_labels,
         with torch.no_grad():
             pred_train = torch.argmax(output, dim=-1)
             target_train = torch.argmax(X_batch, dim=-1)
-            train_token_acc = (pred_train == target_train).float().mean().item()
             train_seq_acc = (pred_train == target_train).all(dim=0).float().mean().item()
 
         model.eval()
@@ -159,7 +164,6 @@ def train(model, X_train, X_test, test_labels,
 
             pred_test = torch.argmax(test_output, dim=-1)
             target_test = torch.argmax(X_test, dim=-1)
-            test_token_acc = (pred_test == target_test).float().mean().item()
             test_seq_acc = (pred_test == target_test).all(dim=0).float().mean().item()            
 
             sil = silhouette_score(test_latent.cpu().numpy(), test_labels.cpu().numpy())
@@ -169,8 +173,6 @@ def train(model, X_train, X_test, test_labels,
         history['ce_loss'].append(ce_loss.item())
         history['contrastive_loss'].append(contrast_loss.item() if isinstance(contrast_loss, torch.Tensor) else 0)
         history['test_loss'].append(float(test_loss))
-        history['train_token_acc'].append(train_token_acc)
-        history['test_token_acc'].append(test_token_acc)
         history['train_seq_acc'].append(train_seq_acc)
         history['test_seq_acc'].append(test_seq_acc)
         history['silhouette'].append(sil)
@@ -178,8 +180,8 @@ def train(model, X_train, X_test, test_labels,
         if (epoch + 1) % 20 == 0 or epoch == 0:
             print(f"Epoch {epoch+1:3d}: Loss={total_loss.item():.4f} "
                   f"(CE={ce_loss.item():.4f} Contr={contrast_loss.item():.4f} "
-                  f"Token={train_token_acc:.3f} Seq={train_seq_acc:.3f} | "
-                  f"Test: Loss={float(test_loss):.4f} Token={test_token_acc:.3f} "
+                  f"Seq={train_seq_acc:.3f} | "
+                  f"Test: Loss={float(test_loss):.4f} "
                   f"Seq={test_seq_acc:.3f} Sil={sil:.3f}")
 
     return history
@@ -189,8 +191,8 @@ def compute_metrics(name, train_metrics, test_metrics, latent_test, test_labels,
     print('\n' + '='*60)
     print(f'Experiment: {name}')
     print('='*60)
-    print(f"Train token acc: {train_metrics['token']:.4f}, Train seq acc: {train_metrics['seq']:.4f}")
-    print(f"Test token acc: {test_metrics['token']:.4f}, Test seq acc: {test_metrics['seq']:.4f}")
+    print(f"Train seq acc: {train_metrics['seq']:.4f}")
+    print(f"Test seq acc: {test_metrics['seq']:.4f}")
     
     # silhouette
     latent_np = latent_test.cpu().numpy()
@@ -201,13 +203,9 @@ def compute_metrics(name, train_metrics, test_metrics, latent_test, test_labels,
     try:
         pca = PCA(n_components=min(3, latent_np.shape[1]))
         proj = pca.fit_transform(latent_np)
-        print(f"PCA explained variance ratio (first {proj.shape[1]}): {pca.explained_variance_ratio_}")
         
         for tidx, tname in enumerate(types):
             mask = (test_labels == tidx)
-            if mask.sum() > 0:
-                mean_coord = proj[mask].mean(axis=0)
-                print(f" Type {tname} mean proj (first 2): {mean_coord[:2]}")
 
         # 3D PCA 
         colors = plt.cm.tab20(np.linspace(0, 1, len(types)))
@@ -222,11 +220,11 @@ def compute_metrics(name, train_metrics, test_metrics, latent_test, test_labels,
             ax.set_xlabel('PC1', fontsize=12)
             ax.set_ylabel('PC2', fontsize=12)
             ax.set_zlabel('PC3', fontsize=12)
-            ax.set_title('PCA 3D Visualization', fontsize=14)
+            ax.set_title('PCA', fontsize=14)
             ax.legend(markerscale=1.5, fontsize='medium')
             
             os.makedirs(SAVE_DIR, exist_ok=True)
-            fname = os.path.join(SAVE_DIR, f"{name}_pca3d_seed{seed}.png")
+            fname = os.path.join(SAVE_DIR, f"{name}.png")
             fig.savefig(fname, bbox_inches='tight', dpi=150)
             plt.close(fig)
     except Exception as e:
@@ -240,7 +238,7 @@ def compute_metrics(name, train_metrics, test_metrics, latent_test, test_labels,
 
         fig, ax = plt.subplots(figsize=(8, 8))
         im = ax.imshow(sim_ord, cmap='coolwarm', vmin=-1, vmax=1, aspect='equal')
-        ax.set_title('Latent Similarity Matrix (by type)', fontsize=14)
+        ax.set_title('Latent Similarity Matrix', fontsize=14)
         fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
         unique_labels, counts = np.unique(labels_ord, return_counts=True)
@@ -256,17 +254,10 @@ def compute_metrics(name, train_metrics, test_metrics, latent_test, test_labels,
         ax.set_yticklabels(types, fontsize=10)
 
         os.makedirs(SAVE_DIR, exist_ok=True)
-        fname = os.path.join(SAVE_DIR, f"{name}_sim_by_label_seed{seed}.png")
+        fname = os.path.join(SAVE_DIR, f"{name}_sim_by_label.png")
         fig.savefig(fname, bbox_inches='tight', dpi=150)
         plt.close(fig)
 
-        print("\nIntra-type similarity:")
-        for tidx, tname in enumerate(types):
-            mask = (np.array(test_labels) == tidx)
-            if mask.sum() > 1:
-                type_lat = latent_np[mask]
-                sims = 1 - pdist(type_lat, metric='cosine')
-                print(f"Type {tname}: mean={sims.mean():.4f}, std={sims.std():.4f}")
     except Exception as e:
         print('Similarity plotting failed:', e)
 
@@ -300,13 +291,11 @@ def run_experiment():
         _, z_test, test_output = model(X_test)
         pred_test = torch.argmax(test_output, dim=-1)
         target_test = torch.argmax(X_test, dim=-1)
-        test_token_acc = (pred_test == target_test).float().mean().item()
         test_seq_acc = (pred_test == target_test).all(dim=0).float().mean().item()
 
-    train_token_acc = history['train_token_acc'][-1]
     train_seq_acc = history['train_seq_acc'][-1]
-    train_metrics = {'token': train_token_acc, 'seq': train_seq_acc}
-    test_metrics = {'token': test_token_acc, 'seq': test_seq_acc}
+    train_metrics = {'seq': train_seq_acc}
+    test_metrics = {'seq': test_seq_acc}
 
     test_labels_np = test_labels.cpu().numpy()
     compute_metrics('improved_ablation', train_metrics, test_metrics,
@@ -323,7 +312,7 @@ def run_experiment():
     ax.axhline(y=0, color='r', linestyle='--', alpha=0.5)
 
     os.makedirs(SAVE_DIR, exist_ok=True)
-    fname = os.path.join(SAVE_DIR, f"silhouette_seed{seed}.png")
+    fname = os.path.join(SAVE_DIR, f"silhouette.png")
     fig.savefig(fname, bbox_inches='tight', dpi=150)
     plt.close(fig)
 
