@@ -14,16 +14,15 @@ import os
 
 
 # =====================================
-ENABLE_AUGMENT = True
 ENABLE_SERIALIZE_Z = True
 ENABLE_CONTRASTIVE = True      
-CONTRASTIVE_WEIGHT = 0.5      
+CONTRASTIVE_WEIGHT = 7   
 # =====================================
 
 seed = 42
-L, m, alpha = 4, 2, 6
-epochs = 250  
-lr = 1e-3
+L, m, alpha = 5, 3, 8
+epochs = 400  
+lr = 3e-3
 d_hidden = 128
 d_latent = 32  
 weight_decay = 1e-3 
@@ -72,67 +71,45 @@ def sequences_to_tensor(sequences, alpha):
     return one_hot.permute(1, 0, 2)
 
 
-def augment_sequences(X_onehot, alpha, prob=0.5):
-    L, B, _ = X_onehot.shape
-    X_aug = X_onehot.clone()
+def contrastive_loss(latent, X_batch, temperature=0.5):
+   
+    L, B, alpha = X_batch.shape
+    
+    # extract position matrix
+    seq_indices = torch.argmax(X_batch, dim=-1).T  # (B, L)
+    
+    # build relation matrix (B, L, L)
+    relation_matrices = []
     for b in range(B):
-        if np.random.rand() < prob:
-            seq_indices = torch.argmax(X_onehot[:, b, :], dim=-1)
-            unique_letters = torch.unique(seq_indices).tolist()
-            n_unique = len(unique_letters)
-            new_letters = np.random.choice(alpha, n_unique, replace=False)
-            mapping = {old: new for old, new in zip(unique_letters, new_letters)}
-            new_indices = torch.tensor([mapping[idx.item()] for idx in seq_indices])
-            new_onehot = torch.zeros(L, alpha)
-            new_onehot[torch.arange(L), new_indices] = 1
-            X_aug[:, b, :] = new_onehot
-    return X_aug
+        seq = seq_indices[b]  # (L,)
+        # relation[i,j] = 1 if seq[i] == seq[j]
+        relation = (seq.unsqueeze(0) == seq.unsqueeze(1)).float()
+        relation_matrices.append(relation)
+    
+    relation_matrices = torch.stack(relation_matrices)  # (B, L, L)
+    relation_vectors = relation_matrices.view(B, -1)  # (B, L*L)   
+    relation_sim = torch.matmul(relation_vectors, relation_vectors.T)  # (B, B)
 
+    norm = torch.sqrt((relation_vectors ** 2).sum(dim=1, keepdim=True))
+    relation_sim = relation_sim / (norm @ norm.T + 1e-8)
 
-def contrastive_loss(latent, labels, temperature=0.5):
-    """   
-    Args:
-        latent: (B, d_latent) 
-        labels: (B,) type labels
-        temperature
-    """
-    B = latent.shape[0]
-    # L2 normalize
-    latent_norm = F.normalize(latent, p=2, dim=1)
+    latents_norm = F.normalize(latent, p=2, dim=1)
+    latent_sim = torch.matmul(latents_norm, latents_norm.T) / temperature
+    
+    exp_sim = torch.exp(latent_sim)
+    weighted_positive = (exp_sim * relation_sim).sum(dim=1)
+    all_sum = exp_sim.sum(dim=1) - torch.diag(exp_sim)  
 
-    similarity = torch.matmul(latent_norm, latent_norm.T) / temperature  # (B, B)
-    
-    # positive mask 
-    labels_expanded = labels.unsqueeze(0)  # (1, B)
-    labels_T = labels.unsqueeze(1)  # (B, 1)
-    positive_mask = (labels_expanded == labels_T).float()  # (B, B)
-    
-    # Remove diagonal 
-    positive_mask = positive_mask * (1 - torch.eye(B, device=latent.device))
-    
-    # Calculate loss (InfoNCE)
-    exp_sim = torch.exp(similarity)
-    
-    # sum of positive samples / sum of all samples
-    positive_sum = (exp_sim * positive_mask).sum(dim=1)
-    all_sum = exp_sim.sum(dim=1) - torch.diag(exp_sim) 
-    
-    loss = -torch.log(positive_sum / (all_sum + 1e-8) + 1e-8)
-    
-    # Only compute loss for samples with positive examples
-    valid_mask = positive_mask.sum(dim=1) > 0
-    if valid_mask.sum() > 0:
-        loss = loss[valid_mask].mean()
-    else:
-        loss = torch.tensor(0.0, device=latent.device)
+    loss = -torch.log(weighted_positive / (all_sum + 1e-8) + 1e-8)
+    loss = loss.mean()
     
     return loss
 
 
-def train_autoencoder_improved(model, X_train, X_test, train_labels, test_labels,
+
+def train(model, X_train, X_test, test_labels,
                                n_epochs=300, lr=0.001, weight_decay=0,
-                               use_augment=True, use_contrastive=True,
-                               contrastive_weight=0.5):
+                               use_contrastive=True, contrastive_weight=0.5):
     
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
 
@@ -146,11 +123,7 @@ def train_autoencoder_improved(model, X_train, X_test, train_labels, test_labels
         model.train()
         optimizer.zero_grad()
 
-        if use_augment:
-            X_batch = augment_sequences(X_train, alpha, prob=0.5)
-        else:
-            X_batch = X_train
-
+        X_batch = X_train
         hidden, latent, output = model(X_batch)
 
         ce_loss = F.cross_entropy(
@@ -161,7 +134,7 @@ def train_autoencoder_improved(model, X_train, X_test, train_labels, test_labels
 
         contrast_loss = torch.tensor(0.0)
         if use_contrastive:
-            contrast_loss = contrastive_loss(latent, train_labels, temperature=0.5)
+            contrast_loss = contrastive_loss(latent, X_batch, temperature=0.5)
             total_loss = total_loss + contrastive_weight * contrast_loss
 
         total_loss.backward()
@@ -212,7 +185,7 @@ def train_autoencoder_improved(model, X_train, X_test, train_labels, test_labels
     return history
 
 
-def compute_metrics_and_print(name, train_metrics, test_metrics, latent_test, test_labels, types):
+def compute_metrics(name, train_metrics, test_metrics, latent_test, test_labels, types):
     print('\n' + '='*60)
     print(f'Experiment: {name}')
     print('='*60)
@@ -304,7 +277,6 @@ def run_experiment():
     model = RNNAutoencoder(
         alpha, d_hidden, num_layers, d_latent, L,
         enable_serialize=ENABLE_SERIALIZE_Z,
-        serialize_type='linear'
     ).to(device)
 
     seq_train, seq_test, labels_train, labels_test, types = generate_instances(
@@ -315,10 +287,9 @@ def run_experiment():
     train_labels = torch.tensor(labels_train, dtype=torch.long)
     test_labels = torch.tensor(labels_test, dtype=torch.long)
 
-    history = train_autoencoder_improved(
-        model, X_train, X_test, train_labels, test_labels,
+    history = train(
+        model, X_train, X_test, test_labels,
         n_epochs=epochs, lr=lr, weight_decay=weight_decay,
-        use_augment=ENABLE_AUGMENT,
         use_contrastive=ENABLE_CONTRASTIVE,
         contrastive_weight=CONTRASTIVE_WEIGHT
     )
@@ -338,7 +309,7 @@ def run_experiment():
     test_metrics = {'token': test_token_acc, 'seq': test_seq_acc}
 
     test_labels_np = test_labels.cpu().numpy()
-    compute_metrics_and_print('improved_ablation', train_metrics, test_metrics,
+    compute_metrics('improved_ablation', train_metrics, test_metrics,
                             z_test, test_labels_np, types)
     
     # Silhouette score over epochs

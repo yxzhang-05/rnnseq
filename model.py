@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from colorstrings import colorstrings as cs
-from collections import OrderedDict, namedtuple
+from collections import namedtuple
 
 # Use PyTorch's internal namedtuple for custom load_state_dict results
 LoadStateDictResult = namedtuple('LoadStateDictResult', ['missing_keys', 'unexpected_keys'])
@@ -517,12 +517,8 @@ class RNNAutoencoder(nn.Module):
             from_file = [], # parameters to set from file; list with elements in ['i2h', 'h2h', 'h2o']
             init_weights=None,
             layer_type=nn.Linear,
-            # Optional features for ablation/reproducibility
-            enable_position_encoding: bool = False,
-            pos_enc_scale: float = 0.02,
+            # Optional features 
             enable_serialize: bool = False,
-            serialize_type: str = 'linear',
-            latent_dropout_p: float = 0.0,
         ):
         super(RNNAutoencoder, self).__init__()
 
@@ -540,23 +536,11 @@ class RNNAutoencoder(nn.Module):
         self.decoder = RNNDecoder(d_latent, d_hidden, num_layers, d_input, nonlinearity, device,
             init_weights=init_weights, layer_type=layer_type, sequence_length=sequence_length)
 
-        # Optional in-model features (for strict reproduction)
-        self.enable_position_encoding = enable_position_encoding
-        self.pos_enc_scale = pos_enc_scale
-        if self.enable_position_encoding:
-            self.pos_enc = nn.Parameter(torch.randn(sequence_length, d_latent) * pos_enc_scale)
-        else:
-            self.pos_enc = None
-
         self.enable_serialize = enable_serialize
-        self.serialize_type = serialize_type
         if self.enable_serialize:
-            # default: single linear mapping from z -> L * d_latent
-            self.serialize_net = nn.Linear(d_latent, sequence_length * d_latent)
-        else:
-            self.serialize_net = None
+            # single linear mapping from z -> L * d_latent
+            self.serialize = nn.Linear(d_latent, sequence_length * d_latent)
 
-        self.latent_dropout_p = float(latent_dropout_p)
 
     @property
     def h2h (self):
@@ -575,31 +559,18 @@ class RNNAutoencoder(nn.Module):
 
         hidden, latent = self.encoder(x, delay=self.delay)
 
-        # latent: (batch, d_latent)
-        z = latent
-
-        # apply latent dropout during training
-        if self.latent_dropout_p > 0:
-            z = F.dropout(z, p=self.latent_dropout_p, training=self.training)
-
-        # optional serialize to sequence
-        z_seq = None
-        if self.enable_serialize and self.serialize_net is not None:
-            z_s = self.serialize_net(z)  # (B, L * d_latent)
-            B = z_s.shape[0]
-            z_seq = z_s.view(B, self.sequence_length, self.d_latent).permute(1,0,2).contiguous()  # (L,B,d_latent)
-
-        # optional position encoding
-        if self.pos_enc is not None:
-            if z_seq is None:
-                z_seq = z.unsqueeze(0).expand(self.sequence_length, -1, -1)
-            z_seq = z_seq + self.pos_enc.unsqueeze(1)
+        # serialize to sequence
+        latent_seq = None
+        if self.enable_serialize: 
+            latent_s = self.serialize(latent)  # (B, L * d_latent)
+            B = latent_s.shape[0]
+            latent_seq = latent_s.view(B, self.sequence_length, self.d_latent).permute(1,0,2).contiguous()  # (L,B,d_latent)
 
         # decode
-        if z_seq is not None:
-            rnn_out_dec, output = self.decoder.rnn(z_seq)
+        if latent_seq is not None:
+            rnn_out_dec, output = self.decoder.rnn(latent_seq)
         else:
-            output = self.decoder(z)
+            output = self.decoder(latent)
 
         return hidden, latent, output
 
