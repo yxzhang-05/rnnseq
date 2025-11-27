@@ -14,8 +14,8 @@ import os
 
 
 # =====================================
-ENABLE_SERIALIZE_Z = True
-ENABLE_CONTRASTIVE = True      
+ENABLE_SERIALIZE_Z = False
+ENABLE_CONTRASTIVE = False      
 CONTRASTIVE_WEIGHT = 2.5   
 # =====================================
 
@@ -123,7 +123,7 @@ def train(model, X_train, X_test, test_labels,
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
 
     history = {k: [] for k in ['train_loss', 'ce_loss', 'contrastive_loss', 'test_loss',
-                               'train_seq_acc', 'test_seq_acc', 'silhouette']}
+                               'train_acc', 'test_acc', 'silhouette']}
  
     for epoch in range(n_epochs):
         model.train()
@@ -151,7 +151,7 @@ def train(model, X_train, X_test, test_labels,
         with torch.no_grad():
             pred_train = torch.argmax(output, dim=-1)
             target_train = torch.argmax(X_batch, dim=-1)
-            train_seq_acc = (pred_train == target_train).all(dim=0).float().mean().item()
+            train_acc = (pred_train == target_train).all(dim=0).float().mean().item()
 
         model.eval()
         with torch.no_grad():
@@ -164,7 +164,7 @@ def train(model, X_train, X_test, test_labels,
 
             pred_test = torch.argmax(test_output, dim=-1)
             target_test = torch.argmax(X_test, dim=-1)
-            test_seq_acc = (pred_test == target_test).all(dim=0).float().mean().item()            
+            test_acc = (pred_test == target_test).all(dim=0).float().mean().item()            
 
             sil = silhouette_score(test_latent.cpu().numpy(), test_labels.cpu().numpy())
 
@@ -173,60 +173,53 @@ def train(model, X_train, X_test, test_labels,
         history['ce_loss'].append(ce_loss.item())
         history['contrastive_loss'].append(contrast_loss.item() if isinstance(contrast_loss, torch.Tensor) else 0)
         history['test_loss'].append(float(test_loss))
-        history['train_seq_acc'].append(train_seq_acc)
-        history['test_seq_acc'].append(test_seq_acc)
+        history['train_acc'].append(train_acc)
+        history['test_acc'].append(test_acc)
         history['silhouette'].append(sil)
 
         if (epoch + 1) % 20 == 0 or epoch == 0:
             print(f"Epoch {epoch+1:3d}: Loss={total_loss.item():.4f} "
                   f"(CE={ce_loss.item():.4f} Contr={contrast_loss.item():.4f} "
-                  f"Seq={train_seq_acc:.3f} | "
+                  f"Acc={train_acc:.3f} | "
                   f"Test: Loss={float(test_loss):.4f} "
-                  f"Seq={test_seq_acc:.3f} Sil={sil:.3f}")
+                  f"Acc={test_acc:.3f} Sil={sil:.3f}")
 
     return history
 
 
-def compute_metrics(name, train_metrics, test_metrics, latent_test, test_labels, types):
+def compute_metrics(train_metrics, test_metrics, latent_test, test_labels, types):
     print('\n' + '='*60)
-    print(f'Experiment: {name}')
     print('='*60)
-    print(f"Train seq acc: {train_metrics['seq']:.4f}")
-    print(f"Test seq acc: {test_metrics['seq']:.4f}")
+    print(f"Train acc: {train_metrics['acc']:.4f}")
+    print(f"Test acc: {test_metrics['acc']:.4f}")
     
     # silhouette
     latent_np = latent_test.cpu().numpy()
     sil = silhouette_score(latent_np, test_labels)
-    print(f"Silhouette score (test latent): {sil:.4f}")
+    print(f"Silhouette score: {sil:.4f}")
 
-    # PCA
+    # PCA (2D)
     try:
-        pca = PCA(n_components=min(3, latent_np.shape[1]))
+        pca = PCA(n_components=2)
         proj = pca.fit_transform(latent_np)
         
+        colors = plt.cm.tab20(np.linspace(0, 1, len(types)))
+        fig, ax = plt.subplots(figsize=(6, 5))
         for tidx, tname in enumerate(types):
             mask = (test_labels == tidx)
-
-        # 3D PCA 
-        colors = plt.cm.tab20(np.linspace(0, 1, len(types)))
-        if proj.shape[1] >= 3:
-            fig = plt.figure(figsize=(10, 8))
-            ax = fig.add_subplot(111, projection='3d')
-            for tidx, tname in enumerate(types):
-                mask = (test_labels == tidx)
-                if mask.sum() > 0:
-                    ax.scatter(proj[mask, 0], proj[mask, 1], proj[mask, 2],
-                             label=tname, color=colors[tidx], alpha=0.7, s=50)
-            ax.set_xlabel('PC1', fontsize=12)
-            ax.set_ylabel('PC2', fontsize=12)
-            ax.set_zlabel('PC3', fontsize=12)
-            ax.set_title('PCA', fontsize=14)
-            ax.legend(markerscale=1.5, fontsize='medium')
-            
-            os.makedirs(SAVE_DIR, exist_ok=True)
-            fname = os.path.join(SAVE_DIR, f"{name}.png")
-            fig.savefig(fname, bbox_inches='tight', dpi=150)
-            plt.close(fig)
+            if mask.sum() > 0:
+                ax.scatter(proj[mask, 0], proj[mask, 1],
+                         label=tname, color=colors[tidx], alpha=0.7, s=50)
+        ax.set_xlabel('PC1', fontsize=12)
+        ax.set_ylabel('PC2', fontsize=12)
+        ax.set_title('PCA (final latent)', fontsize=14)
+        ax.legend(markerscale=1.5, fontsize='small', ncol=2)
+        ax.grid(True, alpha=0.3)
+        
+        os.makedirs(SAVE_DIR, exist_ok=True)
+        fname = os.path.join(SAVE_DIR, f"PCA.png")
+        fig.savefig(fname, bbox_inches='tight', dpi=150)
+        plt.close(fig)
     except Exception as e:
         print('PCA failed:', e)
 
@@ -236,9 +229,9 @@ def compute_metrics(name, train_metrics, test_metrics, latent_test, test_labels,
         sim_ord = sim[np.ix_(order, order)]
         labels_ord = np.array(test_labels)[order]
 
-        fig, ax = plt.subplots(figsize=(8, 8))
-        im = ax.imshow(sim_ord, cmap='coolwarm', vmin=-1, vmax=1, aspect='equal')
-        ax.set_title('Latent Similarity Matrix', fontsize=14)
+        fig, ax = plt.subplots(figsize=(5, 5))
+        im = ax.imshow(sim_ord, cmap='viridis', vmin=-1, vmax=1, aspect='equal')
+        ax.set_title('Latent Similarity', fontsize=14)
         fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
         unique_labels, counts = np.unique(labels_ord, return_counts=True)
@@ -254,12 +247,214 @@ def compute_metrics(name, train_metrics, test_metrics, latent_test, test_labels,
         ax.set_yticklabels(types, fontsize=10)
 
         os.makedirs(SAVE_DIR, exist_ok=True)
-        fname = os.path.join(SAVE_DIR, f"{name}_sim_by_label.png")
+        fname = os.path.join(SAVE_DIR, f"latent_sim.png")
         fig.savefig(fname, bbox_inches='tight', dpi=150)
         plt.close(fig)
 
     except Exception as e:
         print('Similarity plotting failed:', e)
+
+
+def plot_results(history, model, X_test, test_labels_np, types, save_dir=SAVE_DIR):
+
+    def smooth(y, window):
+        y = np.array(y)
+        if len(y) < window:
+            return y
+        # use valid mode to avoid edge artifacts, then pad to original length
+        w = np.ones(window) / window
+        y_smooth = np.convolve(y, w, mode='valid')
+        # pad edges with original values
+        pad_left = (len(y) - len(y_smooth)) // 2
+        pad_right = len(y) - len(y_smooth) - pad_left
+        return np.concatenate([y[:pad_left], y_smooth, y[-pad_right:]])
+
+    # Loss + accuracy
+    epochs_range = range(1, len(history['train_loss']) + 1)
+    fig, ax1 = plt.subplots(figsize=(3.5, 3), constrained_layout=True)
+    # train=blue, test=green; loss=solid, acc=dashed
+    ax1.plot(epochs_range, smooth(history['train_loss'], 10), label='Train loss', color='b', linewidth=1.5, linestyle='-')
+    ax1.plot(epochs_range, smooth(history['test_loss'], 10), label='Test loss', color='g', linewidth=1.5, linestyle='-')
+    ax1.set_xlabel('Epoch')
+    ax1.set_ylabel('Loss')
+    ax1.grid(True, alpha=0.3)
+
+    ax2 = ax1.twinx()
+    ax2.plot(epochs_range, smooth(history['train_acc'], 10), label='Train acc', color='b', linewidth=1.5, linestyle='--')
+    ax2.plot(epochs_range, smooth(history['test_acc'], 10), label='Test acc', color='g', linewidth=1.5, linestyle='--')
+    ax2.set_ylabel('acc')
+
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper center', bbox_to_anchor=(0.5, 1.25), ncol=2, frameon=False)
+
+    os.makedirs(save_dir, exist_ok=True)
+    fname = os.path.join(save_dir, f"loss_acc.png")
+    fig.savefig(fname, bbox_inches='tight', dpi=150)
+    plt.close(fig)
+
+    # Hidden/latent per-timestep similarity
+    with torch.no_grad():
+        hidden_test, z_test, test_output = model(X_test)
+
+    if hidden_test is not None:
+        hidden_np = hidden_test.cpu().numpy()
+        order = np.argsort(test_labels_np)
+        L_ts = hidden_np.shape[0]
+        ncols = min(4, L_ts)
+        nrows = int(np.ceil(L_ts / ncols))
+        fig, axes = plt.subplots(nrows, ncols, figsize=(4*ncols, 4*nrows))
+        axes = np.array(axes).reshape(-1)
+        for t in range(L_ts):
+            ax = axes[t]
+            sim = 1 - squareform(pdist(hidden_np[t], metric='cosine'))
+            sim_ord = sim[np.ix_(order, order)]
+            im = ax.imshow(sim_ord, cmap='viridis', vmin=-1, vmax=1, aspect='equal')
+            ax.set_title(f'Timestep {t+1}')
+            ax.set_xticks([])
+            ax.set_yticks([])
+        for ax in axes[L_ts:]:
+            ax.axis('off')
+        fig.colorbar(im, ax=axes.tolist(), fraction=0.02)
+        fname = os.path.join(save_dir, f"latent_by_timestep.png")
+        fig.savefig(fname, bbox_inches='tight', dpi=150)
+        plt.close(fig)
+
+        # PCA branching structure - show how types diverge across timesteps
+        try:
+            # Get encoder and decoder hidden states
+            with torch.no_grad():
+                # Encoder hidden states (already have from earlier)
+                encoder_hidden = hidden_test.cpu().numpy()  # (L, B, N)
+                
+                # Decoder hidden states - need to get from decoder RNN
+                if model.enable_serialize:
+                    latent_s = model.serialize(z_test)
+                    B = latent_s.shape[0]
+                    latent_seq = latent_s.view(B, model.sequence_length, model.d_latent).permute(1,0,2).contiguous()
+                    decoder_hidden, _ = model.decoder.rnn(latent_seq)
+                else:
+                    latent_expanded = z_test.unsqueeze(0).expand(model.sequence_length, *[-1] * z_test.dim())
+                    decoder_hidden, _ = model.decoder.rnn(latent_expanded)
+                
+                decoder_hidden = decoder_hidden.cpu().numpy()  # (L, B, N)
+            
+            L_ts = encoder_hidden.shape[0]
+            
+            # Plot encoder PCA - branching structure
+            # Collect all prefix-type combinations at each timestep
+            all_hiddens = []
+            all_labels = []
+            all_timesteps = []
+            
+            for t in range(L_ts):
+                # At timestep t, we have read t+1 characters
+                prefix_length = t + 1
+                
+                # Group types by their prefix of length prefix_length
+                prefix_groups = {}
+                for tidx, tname in enumerate(types):
+                    mask = (test_labels_np == tidx)
+                    if mask.sum() > 0:
+                        prefix = tname[:prefix_length]
+                        if prefix not in prefix_groups:
+                            prefix_groups[prefix] = []
+                        prefix_groups[prefix].append((tidx, mask))
+                
+                # For each unique prefix, average hidden states
+                for prefix, type_list in prefix_groups.items():
+                    # Combine all samples with this prefix
+                    all_masks = [mask for _, mask in type_list]
+                    combined_mask = np.logical_or.reduce(all_masks)
+                    
+                    # Average over all samples with this prefix
+                    prefix_hidden = encoder_hidden[t, combined_mask, :].mean(axis=0)
+                    all_hiddens.append(prefix_hidden)
+                    all_labels.append(prefix)
+                    all_timesteps.append(t)
+            
+            # Do PCA on all prefix-timestep combinations
+            all_hiddens = np.array(all_hiddens)
+            pca = PCA(n_components=2)
+            proj = pca.fit_transform(all_hiddens)
+            
+            fig, ax = plt.subplots(figsize=(10, 8))
+            
+            # Plot points colored by timestep
+            colors = plt.cm.viridis(np.linspace(0, 1, L_ts))
+            for i, (label, t) in enumerate(zip(all_labels, all_timesteps)):
+                ax.scatter(proj[i, 0], proj[i, 1], c=[colors[t]], s=100, alpha=0.6, edgecolors='black', linewidths=1)
+                ax.text(proj[i, 0], proj[i, 1], label, 
+                       fontsize=8, ha='center', va='center',
+                       bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.7, edgecolor='none'))
+            
+            # Add colorbar for timestep
+            sm = plt.cm.ScalarMappable(cmap='viridis', norm=plt.Normalize(vmin=1, vmax=L_ts))
+            sm.set_array([])
+            cbar = plt.colorbar(sm, ax=ax)
+            cbar.set_label('Timestep', fontsize=12)
+            
+            ax.set_xlabel('PC1', fontsize=12)
+            ax.set_ylabel('PC2', fontsize=12)
+            ax.set_title('Encoder: Branching structure across timesteps', fontsize=14)
+            ax.grid(True, alpha=0.3)
+            
+            fname = os.path.join(save_dir, f"PCA_encoder_branching.png")
+            fig.savefig(fname, bbox_inches='tight', dpi=150)
+            plt.close(fig)
+            
+            # Plot decoder PCA - branching structure
+            all_hiddens = []
+            all_labels = []
+            all_timesteps = []
+            
+            for t in range(L_ts):
+                prefix_length = t + 1
+                prefix_groups = {}
+                for tidx, tname in enumerate(types):
+                    mask = (test_labels_np == tidx)
+                    if mask.sum() > 0:
+                        prefix = tname[:prefix_length]
+                        if prefix not in prefix_groups:
+                            prefix_groups[prefix] = []
+                        prefix_groups[prefix].append((tidx, mask))
+                
+                for prefix, type_list in prefix_groups.items():
+                    all_masks = [mask for _, mask in type_list]
+                    combined_mask = np.logical_or.reduce(all_masks)
+                    prefix_hidden = decoder_hidden[t, combined_mask, :].mean(axis=0)
+                    all_hiddens.append(prefix_hidden)
+                    all_labels.append(prefix)
+                    all_timesteps.append(t)
+            
+            all_hiddens = np.array(all_hiddens)
+            pca = PCA(n_components=2)
+            proj = pca.fit_transform(all_hiddens)
+            
+            fig, ax = plt.subplots(figsize=(10, 8))
+            
+            for i, (label, t) in enumerate(zip(all_labels, all_timesteps)):
+                ax.scatter(proj[i, 0], proj[i, 1], c=[colors[t]], s=100, alpha=0.6, edgecolors='black', linewidths=1)
+                ax.text(proj[i, 0], proj[i, 1], label, 
+                       fontsize=8, ha='center', va='center',
+                       bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.7, edgecolor='none'))
+            
+            sm = plt.cm.ScalarMappable(cmap='viridis', norm=plt.Normalize(vmin=1, vmax=L_ts))
+            sm.set_array([])
+            cbar = plt.colorbar(sm, ax=ax)
+            cbar.set_label('Timestep', fontsize=12)
+            
+            ax.set_xlabel('PC1', fontsize=12)
+            ax.set_ylabel('PC2', fontsize=12)
+            ax.set_title('Decoder: Branching structure across timesteps', fontsize=14)
+            ax.grid(True, alpha=0.3)
+            
+            fname = os.path.join(save_dir, f"PCA_decoder_branching.png")
+            fig.savefig(fname, bbox_inches='tight', dpi=150)
+            plt.close(fig)
+            
+        except Exception as e:
+            print(f'PCA branching plotting failed: {e}')
 
 
 def run_experiment():
@@ -275,7 +470,6 @@ def run_experiment():
     )
     X_train = sequences_to_tensor(seq_train, alpha).to(device)
     X_test = sequences_to_tensor(seq_test, alpha).to(device)
-    train_labels = torch.tensor(labels_train, dtype=torch.long)
     test_labels = torch.tensor(labels_test, dtype=torch.long)
 
     history = train(
@@ -291,30 +485,18 @@ def run_experiment():
         _, z_test, test_output = model(X_test)
         pred_test = torch.argmax(test_output, dim=-1)
         target_test = torch.argmax(X_test, dim=-1)
-        test_seq_acc = (pred_test == target_test).all(dim=0).float().mean().item()
+        test_acc = (pred_test == target_test).all(dim=0).float().mean().item()
 
-    train_seq_acc = history['train_seq_acc'][-1]
-    train_metrics = {'seq': train_seq_acc}
-    test_metrics = {'seq': test_seq_acc}
+    train_acc = history['train_acc'][-1]
+    train_metrics = {'acc': train_acc}
+    test_metrics = {'acc': test_acc}
 
     test_labels_np = test_labels.cpu().numpy()
-    compute_metrics('improved_ablation', train_metrics, test_metrics,
-                            z_test, test_labels_np, types)
+    compute_metrics(train_metrics, test_metrics, z_test, test_labels_np, types)
     
-    # Silhouette score over epochs
-    fig, ax = plt.subplots(figsize=(6, 4))
-    ax.plot(history['silhouette'], linewidth=2, color='green')
-    ax.set_xlabel('Epoch')
-    ax.set_ylabel('Silhouette Score')
-    ax.set_title('Silhouette Score Over Epochs')
-    ax.grid(True, alpha=0.3)
-    # reference line at 0
-    ax.axhline(y=0, color='r', linestyle='--', alpha=0.5)
+    # plotting: moved to helper to keep run_experiment concise
+    plot_results(history, model, X_test, test_labels_np, types, save_dir=SAVE_DIR)
 
-    os.makedirs(SAVE_DIR, exist_ok=True)
-    fname = os.path.join(SAVE_DIR, f"silhouette.png")
-    fig.savefig(fname, bbox_inches='tight', dpi=150)
-    plt.close(fig)
 
 
 if __name__ == '__main__':

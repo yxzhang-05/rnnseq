@@ -482,7 +482,7 @@ class RNNEncoder(nn.Module):
 
 class RNNDecoder(nn.Module):
     def __init__(self, d_latent, d_hidden, num_layers, d_input, nonlinearity, device,
-            init_weights, layer_type, sequence_length):
+            init_weights, layer_type, sequence_length, enable_serialize=False):
         super(RNNDecoder, self).__init__()
         # RNN: d_latent -> d_input
 
@@ -490,16 +490,23 @@ class RNNDecoder(nn.Module):
             init_weights=init_weights, layer_type=layer_type)
         
         self.sequence_length = sequence_length
+        self.enable_serialize = enable_serialize
+        if self.enable_serialize:
+            self.serialize = nn.Linear(d_latent, sequence_length * d_latent)
 
     def forward(self, latent, delay=0):
         '''
         latent is either
         - (batch_dim, d_latent)
-        or
-        - (d_latent,)
         '''
-        # repeat latent vector as many as sequence length
-        latent_expanded = latent.unsqueeze(0).expand(self.sequence_length, *[-1] * latent.dim())
+
+        if self.enable_serialize:
+            B = latent.shape[0]
+            latent_expanded = self.serialize(latent).view(B, self.sequence_length, -1)  # (B, L, d_latent)
+            latent_expanded = latent_expanded.permute(1, 0, 2).contiguous()  # (L, B, d_latent)
+        else:
+            # repeat latent vector as many as sequence length
+            latent_expanded = latent.unsqueeze(0).expand(self.sequence_length, *[-1] * latent.dim())
 
         # Expand the latent vector to match the sequence length, fill with zeros
         # filled_tensor = torch.zeros_like(latent_expanded)
@@ -517,8 +524,7 @@ class RNNAutoencoder(nn.Module):
             from_file = [], # parameters to set from file; list with elements in ['i2h', 'h2h', 'h2o']
             init_weights=None,
             layer_type=nn.Linear,
-            # Optional features 
-            enable_serialize: bool = False,
+            enable_serialize=False,
         ):
         super(RNNAutoencoder, self).__init__()
 
@@ -529,17 +535,11 @@ class RNNAutoencoder(nn.Module):
         self.sequence_length = sequence_length
         self.device = device
 
-
         self.encoder = RNNEncoder(d_input, d_hidden, num_layers, d_latent, nonlinearity, device,
             model_filename, from_file, to_freeze, init_weights, layer_type)
 
         self.decoder = RNNDecoder(d_latent, d_hidden, num_layers, d_input, nonlinearity, device,
-            init_weights=init_weights, layer_type=layer_type, sequence_length=sequence_length)
-
-        self.enable_serialize = enable_serialize
-        if self.enable_serialize:
-            # single linear mapping from z -> L * d_latent
-            self.serialize = nn.Linear(d_latent, sequence_length * d_latent)
+            init_weights=init_weights, layer_type=layer_type, sequence_length=sequence_length, enable_serialize=enable_serialize)
 
 
     @property
@@ -558,22 +558,8 @@ class RNNAutoencoder(nn.Module):
             _masking = lambda h: h
 
         hidden, latent = self.encoder(x, delay=self.delay)
-
-        # serialize to sequence
-        latent_seq = None
-        if self.enable_serialize: 
-            latent_s = self.serialize(latent)  # (B, L * d_latent)
-            B = latent_s.shape[0]
-            latent_seq = latent_s.view(B, self.sequence_length, self.d_latent).permute(1,0,2).contiguous()  # (L,B,d_latent)
-
-        # decode
-        if latent_seq is not None:
-            rnn_out_dec, output = self.decoder.rnn(latent_seq)
-        else:
-            output = self.decoder(latent)
-
-        return hidden, latent, output
-
+        reconstructed = self.decoder(latent, delay=delay)
+        return hidden, latent, reconstructed
 
 
 if __name__ == "__main__":
