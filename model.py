@@ -534,6 +534,7 @@ class RNNAutoencoder(nn.Module):
         self.num_layers = num_layers
         self.sequence_length = sequence_length
         self.device = device
+        self.enable_serialize = enable_serialize
 
         self.encoder = RNNEncoder(d_input, d_hidden, num_layers, d_latent, nonlinearity, device,
             model_filename, from_file, to_freeze, init_weights, layer_type)

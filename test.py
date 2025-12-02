@@ -1,4 +1,5 @@
 import random
+import collections
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -14,9 +15,9 @@ import os
 
 
 # =====================================
-ENABLE_SERIALIZE_Z = False
-ENABLE_CONTRASTIVE = False      
-CONTRASTIVE_WEIGHT = 2.5   
+ENABLE_SERIALIZE_Z = True
+ENABLE_CONTRASTIVE = True      
+CONTRASTIVE_WEIGHT = 2.3   
 # =====================================
 
 seed = 42
@@ -117,8 +118,8 @@ def contrastive_loss(latent, X_batch):
 
 
 def train(model, X_train, X_test, test_labels,
-                               n_epochs=300, lr=0.001, weight_decay=0,
-                               use_contrastive=True, contrastive_weight=0.5):
+        n_epochs=300, lr=0.001, weight_decay=1e-3,
+        use_contrastive=True, contrastive_weight=0.5):
     
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
 
@@ -198,13 +199,13 @@ def compute_metrics(train_metrics, test_metrics, latent_test, test_labels, types
     sil = silhouette_score(latent_np, test_labels)
     print(f"Silhouette score: {sil:.4f}")
 
-    # PCA (2D)
+    # PCA 
     try:
         pca = PCA(n_components=2)
         proj = pca.fit_transform(latent_np)
         
         colors = plt.cm.tab20(np.linspace(0, 1, len(types)))
-        fig, ax = plt.subplots(figsize=(6, 5))
+        fig, ax = plt.subplots(figsize=(4, 4))
         for tidx, tname in enumerate(types):
             mask = (test_labels == tidx)
             if mask.sum() > 0:
@@ -212,8 +213,9 @@ def compute_metrics(train_metrics, test_metrics, latent_test, test_labels, types
                          label=tname, color=colors[tidx], alpha=0.7, s=50)
         ax.set_xlabel('PC1', fontsize=12)
         ax.set_ylabel('PC2', fontsize=12)
-        ax.set_title('PCA (final latent)', fontsize=14)
-        ax.legend(markerscale=1.5, fontsize='small', ncol=2)
+        # place legend above the plot to avoid overlapping points
+        ax.legend(markerscale=1.5, fontsize='small', ncol=min(len(types), 4),
+              loc='upper center', bbox_to_anchor=(0.5, 1.17), frameon=False)
         ax.grid(True, alpha=0.3)
         
         os.makedirs(SAVE_DIR, exist_ok=True)
@@ -309,10 +311,23 @@ def plot_results(history, model, X_test, test_labels_np, types, save_dir=SAVE_DI
             ax = axes[t]
             sim = 1 - squareform(pdist(hidden_np[t], metric='cosine'))
             sim_ord = sim[np.ix_(order, order)]
-            im = ax.imshow(sim_ord, cmap='viridis', vmin=-1, vmax=1, aspect='equal')
+            im = ax.imshow(sim_ord, cmap='viridis', vmin=0, vmax=1, aspect='equal')
             ax.set_title(f'Timestep {t+1}')
             ax.set_xticks([])
             ax.set_yticks([])
+
+            # draw separators between different types (grouped by label)
+            labels_ordered = test_labels_np[order]
+            uniq, counts = np.unique(labels_ordered, return_counts=True)
+            # cumulative boundaries in the ordered index space
+            cumsum = np.cumsum(counts)
+            n = sim_ord.shape[0]
+            for bound in cumsum[:-1]:
+                # draw line between pixels: use -0.5 offset for proper pixel boundary
+                pos = bound - 0.5
+                ax.axhline(pos, color='white', linewidth=1.2, alpha=0.9)
+                ax.axvline(pos, color='white', linewidth=1.2, alpha=0.9)
+
         for ax in axes[L_ts:]:
             ax.axis('off')
         fig.colorbar(im, ax=axes.tolist(), fraction=0.02)
@@ -320,139 +335,79 @@ def plot_results(history, model, X_test, test_labels_np, types, save_dir=SAVE_DI
         fig.savefig(fname, bbox_inches='tight', dpi=150)
         plt.close(fig)
 
-        # PCA branching structure - show how types diverge across timesteps
+    # PCA branching structure 
         try:
-            # Get encoder and decoder hidden states
             with torch.no_grad():
-                # Encoder hidden states (already have from earlier)
-                encoder_hidden = hidden_test.cpu().numpy()  # (L, B, N)
+                # Encoder hidden states (L, B, N)
+                encoder_hidden = hidden_test.cpu().numpy()
                 
-                # Decoder hidden states - need to get from decoder RNN
-                if model.enable_serialize:
-                    latent_s = model.serialize(z_test)
-                    B = latent_s.shape[0]
-                    latent_seq = latent_s.view(B, model.sequence_length, model.d_latent).permute(1,0,2).contiguous()
+                # Decoder hidden states
+                if hasattr(model, 'enable_serialize') and model.enable_serialize:
+                    latent_s = model.decoder.serialize(z_test)
+                    B_curr = latent_s.shape[0]
+                    latent_seq = latent_s.view(B_curr, model.sequence_length, model.d_latent).permute(1, 0, 2).contiguous()
                     decoder_hidden, _ = model.decoder.rnn(latent_seq)
                 else:
                     latent_expanded = z_test.unsqueeze(0).expand(model.sequence_length, *[-1] * z_test.dim())
                     decoder_hidden, _ = model.decoder.rnn(latent_expanded)
                 
-                decoder_hidden = decoder_hidden.cpu().numpy()  # (L, B, N)
-            
-            L_ts = encoder_hidden.shape[0]
-            
-            # Plot encoder PCA - branching structure
-            # Collect all prefix-type combinations at each timestep
-            all_hiddens = []
-            all_labels = []
-            all_timesteps = []
-            
-            for t in range(L_ts):
-                # At timestep t, we have read t+1 characters
-                prefix_length = t + 1
+                decoder_hidden = decoder_hidden.cpu().numpy()
+
+            L_ts = encoder_hidden.shape[0]          
+            batch_labels_str = [types[idx] for idx in test_labels_np]
+
+            def plot_branching_pca(hidden_states, title_prefix, filename_suffix):
+                all_hiddens = []
+                all_labels = []
+                all_timesteps = []
+                for t in range(L_ts):
+                    prefix_length = t + 1                   
+                    groups = collections.defaultdict(list)
+                    for i, full_str in enumerate(batch_labels_str):
+                        if len(full_str) >= prefix_length:
+                            p = full_str[:prefix_length]
+                            groups[p].append(i)
+
+                    for prefix, indices in groups.items():
+                        mean_vec = hidden_states[t, indices, :].mean(axis=0)
+                        all_hiddens.append(mean_vec)
+                        all_labels.append(prefix)
+                        all_timesteps.append(t)
+
+                if len(all_hiddens) == 0:
+                    print(f"Skipping {title_prefix} PCA: No data collected.")
+                    return
+
+                all_hiddens_np = np.array(all_hiddens)
+                pca = PCA(n_components=2)
+                proj = pca.fit_transform(all_hiddens_np)
+
+                fig, ax = plt.subplots(figsize=(4, 3.5))
+                ax.scatter(proj[:, 0], proj[:, 1], alpha=0)
+                colors = plt.cm.plasma(np.linspace(0, 0.85, L_ts))
+
+                for i, (label, t) in enumerate(zip(all_labels, all_timesteps)):
+                    x, y = proj[i, 0], proj[i, 1]
+                    c = colors[t]
+                    ax.text(x, y, label, color=c, fontsize=10, ha='right', va='bottom', alpha=0.8)
+
+                ax.set_xlabel('PC1')
+                ax.set_ylabel('PC2')
+                ax.set_title(f'{title_prefix}', fontsize=12)     
+                ax.grid(True, alpha=0.2)
+                # ax.annotate('Timestep', 
+                #             xy=(0.65, 0.95), xycoords='axes fraction',
+                #             xytext=(0.35, 0.95), textcoords='axes fraction',
+                #             arrowprops=dict(arrowstyle="->", color='black', lw=1.2),
+                #             ha='center', va='center', fontsize=9, color='black')
                 
-                # Group types by their prefix of length prefix_length
-                prefix_groups = {}
-                for tidx, tname in enumerate(types):
-                    mask = (test_labels_np == tidx)
-                    if mask.sum() > 0:
-                        prefix = tname[:prefix_length]
-                        if prefix not in prefix_groups:
-                            prefix_groups[prefix] = []
-                        prefix_groups[prefix].append((tidx, mask))
-                
-                # For each unique prefix, average hidden states
-                for prefix, type_list in prefix_groups.items():
-                    # Combine all samples with this prefix
-                    all_masks = [mask for _, mask in type_list]
-                    combined_mask = np.logical_or.reduce(all_masks)
-                    
-                    # Average over all samples with this prefix
-                    prefix_hidden = encoder_hidden[t, combined_mask, :].mean(axis=0)
-                    all_hiddens.append(prefix_hidden)
-                    all_labels.append(prefix)
-                    all_timesteps.append(t)
-            
-            # Do PCA on all prefix-timestep combinations
-            all_hiddens = np.array(all_hiddens)
-            pca = PCA(n_components=2)
-            proj = pca.fit_transform(all_hiddens)
-            
-            fig, ax = plt.subplots(figsize=(10, 8))
-            
-            # Plot points colored by timestep
-            colors = plt.cm.viridis(np.linspace(0, 1, L_ts))
-            for i, (label, t) in enumerate(zip(all_labels, all_timesteps)):
-                ax.scatter(proj[i, 0], proj[i, 1], c=[colors[t]], s=100, alpha=0.6, edgecolors='black', linewidths=1)
-                ax.text(proj[i, 0], proj[i, 1], label, 
-                       fontsize=8, ha='center', va='center',
-                       bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.7, edgecolor='none'))
-            
-            # Add colorbar for timestep
-            sm = plt.cm.ScalarMappable(cmap='viridis', norm=plt.Normalize(vmin=1, vmax=L_ts))
-            sm.set_array([])
-            cbar = plt.colorbar(sm, ax=ax)
-            cbar.set_label('Timestep', fontsize=12)
-            
-            ax.set_xlabel('PC1', fontsize=12)
-            ax.set_ylabel('PC2', fontsize=12)
-            ax.set_title('Encoder: Branching structure across timesteps', fontsize=14)
-            ax.grid(True, alpha=0.3)
-            
-            fname = os.path.join(save_dir, f"PCA_encoder_branching.png")
-            fig.savefig(fname, bbox_inches='tight', dpi=150)
-            plt.close(fig)
-            
-            # Plot decoder PCA - branching structure
-            all_hiddens = []
-            all_labels = []
-            all_timesteps = []
-            
-            for t in range(L_ts):
-                prefix_length = t + 1
-                prefix_groups = {}
-                for tidx, tname in enumerate(types):
-                    mask = (test_labels_np == tidx)
-                    if mask.sum() > 0:
-                        prefix = tname[:prefix_length]
-                        if prefix not in prefix_groups:
-                            prefix_groups[prefix] = []
-                        prefix_groups[prefix].append((tidx, mask))
-                
-                for prefix, type_list in prefix_groups.items():
-                    all_masks = [mask for _, mask in type_list]
-                    combined_mask = np.logical_or.reduce(all_masks)
-                    prefix_hidden = decoder_hidden[t, combined_mask, :].mean(axis=0)
-                    all_hiddens.append(prefix_hidden)
-                    all_labels.append(prefix)
-                    all_timesteps.append(t)
-            
-            all_hiddens = np.array(all_hiddens)
-            pca = PCA(n_components=2)
-            proj = pca.fit_transform(all_hiddens)
-            
-            fig, ax = plt.subplots(figsize=(10, 8))
-            
-            for i, (label, t) in enumerate(zip(all_labels, all_timesteps)):
-                ax.scatter(proj[i, 0], proj[i, 1], c=[colors[t]], s=100, alpha=0.6, edgecolors='black', linewidths=1)
-                ax.text(proj[i, 0], proj[i, 1], label, 
-                       fontsize=8, ha='center', va='center',
-                       bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.7, edgecolor='none'))
-            
-            sm = plt.cm.ScalarMappable(cmap='viridis', norm=plt.Normalize(vmin=1, vmax=L_ts))
-            sm.set_array([])
-            cbar = plt.colorbar(sm, ax=ax)
-            cbar.set_label('Timestep', fontsize=12)
-            
-            ax.set_xlabel('PC1', fontsize=12)
-            ax.set_ylabel('PC2', fontsize=12)
-            ax.set_title('Decoder: Branching structure across timesteps', fontsize=14)
-            ax.grid(True, alpha=0.3)
-            
-            fname = os.path.join(save_dir, f"PCA_decoder_branching.png")
-            fig.savefig(fname, bbox_inches='tight', dpi=150)
-            plt.close(fig)
-            
+                fname = os.path.join(save_dir, f"PCA_{filename_suffix}_branching.png")
+                fig.savefig(fname, bbox_inches='tight', dpi=150)
+                plt.close(fig)
+
+            plot_branching_pca(encoder_hidden, "Encoder", "encoder")
+            plot_branching_pca(decoder_hidden, "Decoder", "decoder")
+
         except Exception as e:
             print(f'PCA branching plotting failed: {e}')
 
@@ -460,8 +415,7 @@ def plot_results(history, model, X_test, test_labels_np, types, save_dir=SAVE_DI
 def run_experiment():
     set_seed(seed)
 
-    model = RNNAutoencoder(
-        alpha, d_hidden, num_layers, d_latent, L,
+    model = RNNAutoencoder(alpha, d_hidden, num_layers, d_latent, L,
         enable_serialize=ENABLE_SERIALIZE_Z,
     ).to(device)
 
