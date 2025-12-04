@@ -4,7 +4,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import os
 from model import RNNAutoencoder
-from test import generate_instances, sequences_to_tensor, train
+from test import generate_instances, sequences_to_tensor, train, plot_all_diagnostics
 from sklearn.metrics import silhouette_score
 
 def run_acc_vs_weight_experiment():
@@ -55,12 +55,18 @@ def run_acc_vs_weight_experiment():
             test_labels = torch.tensor(labels_test, dtype=torch.long)
 
             # 训练
-            _ = train(
-                model, X_train, X_test, test_labels,
+            history = train(
+                model, X_train, X_test, test_labels, train_labels=torch.tensor(labels_train, dtype=torch.long),
                 n_epochs=epochs, lr=lr,
                 use_contrastive=True,
-                contrastive_weight=float(w)
+                contrastive_weight=float(w), types=types, save_dir='results'
             )
+
+            # final-epoch diagnostics (SVG)
+            try:
+                plot_all_diagnostics(model, X_train, torch.tensor(labels_train, dtype=torch.long), X_test, test_labels, types, save_dir='results', history=history)
+            except Exception:
+                pass
             
             # 获取最终 Test Accuracy
             model.eval()
@@ -84,17 +90,17 @@ def run_acc_vs_weight_experiment():
     
     plt.rcParams['font.family'] = 'sans-serif'
     plt.rcParams['font.sans-serif'] = ['Arial']
-    fig, ax = plt.subplots(figsize=(8, 6))
+    fig, ax = plt.subplots(figsize=(4, 4))
 
     # 绘制两条线
     # Line 1: No Serialize
     ax.plot(contrastive_weights, results[False], 
-            marker='o', markersize=8, linewidth=2.5, linestyle='-', 
+            marker='o', markersize=6, linewidth=2.5, linestyle='-', 
             color='#1f77b4', label='No Serialize')
 
     # Line 2: Serialize
     ax.plot(contrastive_weights, results[True], 
-            marker='s', markersize=8, linewidth=2.5, linestyle='--', 
+            marker='s', markersize=6, linewidth=2.5, linestyle='--', 
             color="#317826", label='Serialize')   
 
     # 图表装饰
@@ -106,28 +112,28 @@ def run_acc_vs_weight_experiment():
     ax.set_ylim(-0.05, 1.05) # 留一点余地
     ax.grid(True, linestyle=':', alpha=0.6)
     
-    # 添加图例
-    ax.legend(fontsize=12, loc='best', frameon=True, shadow=True)
+    # Place legend above the plot, centered, no frame
+    ax.legend(fontsize=12, loc='upper center', bbox_to_anchor=(0.5, 1.12), ncol=2, frameon=False)
 
     # 保存图片
     save_dir = "results"
     os.makedirs(save_dir, exist_ok=True)
-    save_path = os.path.join(save_dir, "acc_vs_weight.png")
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    save_path = os.path.join(save_dir, "acc_vs_weight.svg")
+    plt.savefig(save_path, bbox_inches='tight')
     plt.close()
     
     print(f"Plot saved to: {save_path}")
 
     # --- Silhouette vs weight ---
     print("Plotting silhouette vs weight...")
-    fig, ax = plt.subplots(figsize=(8, 6))
+    fig, ax = plt.subplots(figsize=(4, 4))
 
     ax.plot(contrastive_weights, results_sil[False],
-            marker='o', markersize=8, linewidth=2.5, linestyle='-',
+            marker='o', markersize=6, linewidth=2.5, linestyle='-',
             color='#1f77b4', label='No Serialize')
 
     ax.plot(contrastive_weights, results_sil[True],
-            marker='s', markersize=8, linewidth=2.5, linestyle='--',
+            marker='s', markersize=6, linewidth=2.5, linestyle='--',
             color='#317826', label='Serialize')
 
     ax.set_xlabel('Contrastive Loss Weight', fontsize=14, fontweight='bold')
@@ -135,10 +141,11 @@ def run_acc_vs_weight_experiment():
     ax.set_xticks(contrastive_weights)
     ax.set_ylim(-1.05, 1.05)
     ax.grid(True, linestyle=':', alpha=0.6)
-    ax.legend(fontsize=12, loc='best', frameon=True, shadow=True)
+    # Place legend above the plot, centered, no frame
+    ax.legend(fontsize=12, loc='upper center', bbox_to_anchor=(0.5, 1.12), ncol=2, frameon=False)
 
-    save_path = os.path.join(save_dir, "silhouette_vs_weight.png")
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    save_path = os.path.join(save_dir, "silhouette_vs_weight.svg")
+    plt.savefig(save_path, bbox_inches='tight')
     plt.close()
     print(f"Silhouette plot saved to: {save_path}")
 
