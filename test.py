@@ -15,7 +15,7 @@ import os
 
 
 # =====================================
-ENABLE_SERIALIZE_Z = False
+ENABLE_SERIALIZE_Z = True
 ENABLE_CONTRASTIVE = False      
 CONTRASTIVE_WEIGHT = 0   
 # =====================================
@@ -283,51 +283,57 @@ def plot_diagnostics(model, X_train, train_labels, X_test, test_labels, types, s
                 except Exception as e:
                     print(f"Serialized latent timestep similarity failed ({phase}): {e}")
 
-            # Encoder PCA (separate plot)
+            # Encoder PCA (separate plot, 3D)
             try:
                 if hidden_np is not None:
                     enc_final = hidden_np[-1]
-                    pca_enc = PCA(n_components=2)
+                    pca_enc = PCA(n_components=3)
                     proj_enc = pca_enc.fit_transform(enc_final)
                     colors = plt.cm.tab20(np.linspace(0, 1, len(types)))
                     
-                    fig, ax = plt.subplots(figsize=(4, 4))
+                    fig = plt.figure(figsize=(6, 6))
+                    ax = fig.add_subplot(111, projection='3d')
                     for tidx in range(len(types)):
                         mask = (labels_np == tidx)
                         if mask.sum() > 0:
-                            ax.scatter(proj_enc[mask, 0], proj_enc[mask, 1], label=types[tidx], color=colors[tidx], s=30, alpha=0.8)
+                            ax.scatter(proj_enc[mask, 0], proj_enc[mask, 1], proj_enc[mask, 2], 
+                                      label=types[tidx], color=colors[tidx], s=30, alpha=0.8)
                     ax.set_xlabel('PC1')
                     ax.set_ylabel('PC2')
+                    ax.set_zlabel('PC3')
                     # legend in 2 rows (ncol = half of types, rounded up)
                     ncol_legend = max(1, (len(types) + 1) // 2)
-                    ax.legend(fontsize='small', ncol=ncol_legend, loc='upper center', bbox_to_anchor=(0.5, 1.17), frameon=False)
+                    ax.legend(fontsize='small', ncol=ncol_legend, loc='upper center', bbox_to_anchor=(0.5, 1.1), frameon=False)
                     ax.grid(True, alpha=0.2)
                     
-                    fname = os.path.join(save_dir, f"encoder_pca_{phase}.svg")
+                    fname = os.path.join(save_dir, f"encoder_pca3D_{phase}.svg")
                     fig.savefig(fname, bbox_inches='tight')
                     plt.close(fig)
             except Exception as e:
                 print(f"Encoder PCA failed ({phase}): {e}")
             
-            # Latent PCA (separate plot, using encoder output z)
+            # Latent PCA (separate plot, using encoder output z, 3D)
             try:
-                pca_lat = PCA(n_components=2)
+                pca_lat = PCA(n_components=3)
                 proj_lat = pca_lat.fit_transform(z_np)
                 colors = plt.cm.tab20(np.linspace(0, 1, len(types)))
                 
-                fig, ax = plt.subplots(figsize=(4, 4))
+                fig = plt.figure(figsize=(6, 6))
+                ax = fig.add_subplot(111, projection='3d')
                 for tidx in range(len(types)):
                     mask = (labels_np == tidx)
                     if mask.sum() > 0:
-                        ax.scatter(proj_lat[mask, 0], proj_lat[mask, 1], label=types[tidx], color=colors[tidx], s=30, alpha=0.8)
+                        ax.scatter(proj_lat[mask, 0], proj_lat[mask, 1], proj_lat[mask, 2], 
+                                  label=types[tidx], color=colors[tidx], s=30, alpha=0.8)
                 ax.set_xlabel('PC1')
                 ax.set_ylabel('PC2')
+                ax.set_zlabel('PC3')
                 # legend in 2 rows (ncol = half of types, rounded up)
                 ncol_legend = max(1, (len(types) + 1) // 2)
-                ax.legend(fontsize='small', ncol=ncol_legend, loc='upper center', bbox_to_anchor=(0.5, 1.17), frameon=False)
+                ax.legend(fontsize='small', ncol=ncol_legend, loc='upper center', bbox_to_anchor=(0.5, 1.1), frameon=False)
                 ax.grid(True, alpha=0.2)
                 
-                fname = os.path.join(save_dir, f"latent_pca_{phase}.svg")
+                fname = os.path.join(save_dir, f"latent_pca3D_{phase}.svg")
                 fig.savefig(fname, bbox_inches='tight')
                 plt.close(fig)
             except Exception as e:
@@ -389,36 +395,36 @@ def plot_diagnostics(model, X_train, train_labels, X_test, test_labels, types, s
         print(f"plot_all_diagnostics failed: {e}")
     
     # smoothed loss/acc curves
-    # def smooth(y, window=10):
-    #     y = np.array(y)
-    #     if len(y) < window:
-    #         return y
-    #     w = np.ones(window) / window
-    #     y_smooth = np.convolve(y, w, mode='valid')
-    #     pad_left = (len(y) - len(y_smooth)) // 2
-    #     pad_right = len(y) - len(y_smooth) - pad_left
-    #     return np.concatenate([y[:pad_left], y_smooth, y[-pad_right:]])
+    def smooth(y, window=10):
+        y = np.array(y)
+        if len(y) < window:
+            return y
+        w = np.ones(window) / window
+        y_smooth = np.convolve(y, w, mode='valid')
+        pad_left = (len(y) - len(y_smooth)) // 2
+        pad_right = len(y) - len(y_smooth) - pad_left
+        return np.concatenate([y[:pad_left], y_smooth, y[-pad_right:]])
         
-    # epochs_range = range(1, len(history['train_loss']) + 1)
-    # fig, ax1 = plt.subplots(figsize=(3.5, 3), constrained_layout=True)
-    # ax1.plot(epochs_range, smooth(history['train_loss']), label='Train loss', color='b', linewidth=1.5, linestyle='-')
-    # ax1.plot(epochs_range, smooth(history['test_loss']), label='Test loss', color='g', linewidth=1.5, linestyle='-')
-    # ax1.set_xlabel('Epoch')
-    # ax1.set_ylabel('Loss')
-    # ax1.grid(True, alpha=0.3)
+    epochs_range = range(1, len(history['train_loss']) + 1)
+    fig, ax1 = plt.subplots(figsize=(3.5, 3), constrained_layout=True)
+    ax1.plot(epochs_range, smooth(history['train_loss']), label='Train loss', color='b', linewidth=1.5, linestyle='-')
+    ax1.plot(epochs_range, smooth(history['test_loss']), label='Test loss', color='g', linewidth=1.5, linestyle='-')
+    ax1.set_xlabel('Epoch')
+    ax1.set_ylabel('Loss')
+    ax1.grid(True, alpha=0.3)
 
-    # ax2 = ax1.twinx()
-    # ax2.plot(epochs_range, smooth(history['train_acc']), label='Train acc', color='b', linewidth=1.5, linestyle='--')
-    # ax2.plot(epochs_range, smooth(history['test_acc']), label='Test acc', color='g', linewidth=1.5, linestyle='--')
-    # ax2.set_ylabel('acc')
+    ax2 = ax1.twinx()
+    ax2.plot(epochs_range, smooth(history['train_acc']), label='Train acc', color='b', linewidth=1.5, linestyle='--')
+    ax2.plot(epochs_range, smooth(history['test_acc']), label='Test acc', color='g', linewidth=1.5, linestyle='--')
+    ax2.set_ylabel('acc')
 
-    # lines1, labels1 = ax1.get_legend_handles_labels()
-    # lines2, labels2 = ax2.get_legend_handles_labels()
-    # ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper center', bbox_to_anchor=(0.5, 1.25), ncol=2, frameon=False)
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper center', bbox_to_anchor=(0.5, 1.25), ncol=2, frameon=False)
 
-    # fname = os.path.join(save_dir, f"loss_acc.svg")
-    # fig.savefig(fname, bbox_inches='tight')
-    # plt.close(fig)
+    fname = os.path.join(save_dir, f"loss_acc.svg")
+    fig.savefig(fname, bbox_inches='tight')
+    plt.close(fig)
 
 
 def train(model, X_train, X_test, test_labels, train_labels=None,
@@ -547,9 +553,9 @@ def run_experiment():
 
     # save consolidated final-epoch diagnostics (SVGs)
     try:
-        plot_all_diagnostics(model, X_train, torch.tensor(labels_train, dtype=torch.long), X_test, test_labels, types, save_dir=SAVE_DIR, history=history)
+        plot_diagnostics(model, X_train, torch.tensor(labels_train, dtype=torch.long), X_test, test_labels, types, save_dir=SAVE_DIR, history=history)
     except Exception as e:
-        print(f"plot_all_diagnostics failed: {e}")
+        print(f"plot_diagnostics failed: {e}")
 
 
 if __name__ == '__main__':
