@@ -16,7 +16,7 @@ import os
 
 
 # =====================================
-ENABLE_SERIALIZE_Z = False
+ENABLE_SERIALIZE_Z = True
 ENABLE_CONTRASTIVE = False      
 CONTRASTIVE_WEIGHT = 0   
 # =====================================
@@ -185,30 +185,76 @@ def plot_diagnostics(model, X_train, train_labels, X_test, test_labels, types, s
             # except Exception as e:
             #     print(f"Latent PCA spectrum failed ({phase}): {e}")
 
-            # # latent similarity heatmap
-            # try:
-            #     sim = 1 - squareform(pdist(z_np, metric='cosine'))
-            #     order = np.argsort(labels_np)
-            #     sim_ord = sim[np.ix_(order, order)]
-            #     fig, ax = plt.subplots(figsize=(5, 5))
-            #     im = ax.imshow(sim_ord, cmap='viridis', vmin=-1, vmax=1, aspect='equal')
-            #     ax.set_title('Latent Similarity', fontsize=12)
-            #     fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-            #     unique_labels, counts = np.unique(labels_np[order], return_counts=True)
-            #     cum = np.cumsum(counts)
-            #     for c in cum[:-1]:
-            #         ax.axhline(c - 0.5, color='k', linewidth=1.2)
-            #         ax.axvline(c - 0.5, color='k', linewidth=1.2)
-            #     tick_pos = np.cumsum(counts) - counts / 2.0
-            #     ax.set_xticks(tick_pos)
-            #     ax.set_yticks(tick_pos)
-            #     ax.set_xticklabels(types, rotation=90, fontsize=9)
-            #     ax.set_yticklabels(types, fontsize=9)
-            #     fname = os.path.join(save_dir, f"latent_sim_{phase}.svg")
-            #     fig.savefig(fname, bbox_inches='tight')
-            #     plt.close(fig)
-            # except Exception as e:
-            #     print(f"Latent similarity plot failed ({phase}): {e}")
+            # latent similarity heatmap
+            try:
+                # Center the latent representations
+                z_centered = z_np - z_np.mean(axis=0, keepdims=True)
+                sim = 1 - squareform(pdist(z_centered, metric='cosine'))
+                order = np.argsort(labels_np)
+                sim_ord = sim[np.ix_(order, order)]
+                fig, ax = plt.subplots(figsize=(5, 5))
+                im = ax.imshow(sim_ord, cmap='viridis', vmin=-1, vmax=1, aspect='equal')
+                ax.set_title('Latent Similarity', fontsize=12)
+                fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+                unique_labels, counts = np.unique(labels_np[order], return_counts=True)
+                cum = np.cumsum(counts)
+                for c in cum[:-1]:
+                    ax.axhline(c - 0.5, color='k', linewidth=1.2)
+                    ax.axvline(c - 0.5, color='k', linewidth=1.2)
+                tick_pos = np.cumsum(counts) - counts / 2.0
+                ax.set_xticks(tick_pos)
+                ax.set_yticks(tick_pos)
+                ax.set_xticklabels(types, rotation=90, fontsize=9)
+                ax.set_yticklabels(types, fontsize=9)
+                fname = os.path.join(save_dir, f"latent_sim_{phase}.svg")
+                fig.savefig(fname, bbox_inches='tight')
+                plt.close(fig)
+            except Exception as e:
+                print(f"Latent similarity plot failed ({phase}): {e}")
+            
+            # latent similarity heatmap ordered by first two letters
+            if seqs is not None:
+                try:
+                    # Center the latent representations
+                    z_centered = z_np - z_np.mean(axis=0, keepdims=True)
+                    sim = 1 - squareform(pdist(z_centered, metric='cosine'))
+                    
+                    # Extract first two letters and sort by them
+                    first_two_letters = np.array([seq[:2] if len(seq) >= 2 else seq for seq in seqs])
+                    unique_prefixes = sorted(set(first_two_letters))
+                    
+                    # Create ordering based on first two letters
+                    prefix_order = []
+                    for prefix in unique_prefixes:
+                        indices = np.where(first_two_letters == prefix)[0]
+                        prefix_order.extend(indices)
+                    prefix_order = np.array(prefix_order)
+                    
+                    sim_ord = sim[np.ix_(prefix_order, prefix_order)]
+                    fig, ax = plt.subplots(figsize=(5, 5))
+                    im = ax.imshow(sim_ord, cmap='viridis', vmin=-1, vmax=1, aspect='equal')
+                    ax.set_title('Latent Similarity (by first 2 letters)', fontsize=12)
+                    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+                    
+                    # Draw boundaries between different first-two-letter groups
+                    first_two_ordered = first_two_letters[prefix_order]
+                    unique_ord, counts = np.unique(first_two_ordered, return_counts=True)
+                    cum = np.cumsum(counts)
+                    for c in cum[:-1]:
+                        ax.axhline(c - 0.5, color='k', linewidth=1.2)
+                        ax.axvline(c - 0.5, color='k', linewidth=1.2)
+                    
+                    tick_pos = np.cumsum(counts) - counts / 2.0
+                    ax.set_xticks(tick_pos)
+                    ax.set_yticks(tick_pos)
+                    ax.set_xticklabels(unique_ord, rotation=90, fontsize=9)
+                    ax.set_yticklabels(unique_ord, fontsize=9)
+                    
+                    fname = os.path.join(save_dir, f"latent_sim_by_first2_{phase}.svg")
+                    fig.savefig(fname, bbox_inches='tight')
+                    plt.close(fig)
+                except Exception as e:
+                    print(f"Latent similarity by first two letters failed ({phase}): {e}")
 
             # # per-timestep similarity for encoder hidden states (grid layout with type boundaries)
             # if hidden_np is not None:
@@ -289,124 +335,103 @@ def plot_diagnostics(model, X_train, train_labels, X_test, test_labels, types, s
             #     except Exception as e:
             #         print(f"Serialized latent timestep similarity failed ({phase}): {e}")
 
-            # # Encoder PCA (separate plot, 3D interactive)
-            # try:
-            #     if hidden_np is not None:
-            #         enc_final = hidden_np[-1]
-            #         pca_enc = PCA(n_components=3)
-            #         proj_enc = pca_enc.fit_transform(enc_final)
-                    
-            #         # Create interactive plotly 3D scatter
-            #         fig = go.Figure()
-            #         colors_hex = ['#%02x%02x%02x' % tuple(int(c*255) for c in plt.cm.tab20(i/len(types))[:3]) 
-            #                       for i in range(len(types))]
-                    
-            #         for tidx in range(len(types)):
-            #             mask = (labels_np == tidx)
-            #             if mask.sum() > 0:
-            #                 fig.add_trace(go.Scatter3d(
-            #                     x=proj_enc[mask, 0],
-            #                     y=proj_enc[mask, 1],
-            #                     z=proj_enc[mask, 2],
-            #                     mode='markers',
-            #                     name=types[tidx],
-            #                     marker=dict(size=5, color=colors_hex[tidx], opacity=0.8)
-            #                 ))
-                    
-            #         fig.update_layout(
-            #             scene=dict(
-            #                 xaxis_title='PC1',
-            #                 yaxis_title='PC2',
-            #                 zaxis_title='PC3'
-            #             ),
-            #             margin=dict(l=0, r=0, b=0, t=30),
-            #             legend=dict(orientation='h', yanchor='top', y=1.1, xanchor='center', x=0.5)
-            #         )
-                    
-            #         fname = os.path.join(save_dir, f"encoder_pca_{phase}.html")
-            #         fig.write_html(fname)
-            # except Exception as e:
-            #     print(f"Encoder PCA failed ({phase}): {e}")
             
-            # # Latent PCA (separate plot, using encoder output z, 3D interactive)
+            # # Latent PCA (separate plot, using encoder output z, 2D static)
             # try:
-            #     pca_lat = PCA(n_components=3)
+            #     pca_lat = PCA(n_components=2)
             #     proj_lat = pca_lat.fit_transform(z_np)
                 
-            #     # Create interactive plotly 3D scatter
-            #     fig = go.Figure()
-            #     colors_hex = ['#%02x%02x%02x' % tuple(int(c*255) for c in plt.cm.tab20(i/len(types))[:3]) 
-            #                   for i in range(len(types))]
+            #     # Create matplotlib 2D scatter
+            #     fig, ax = plt.subplots(figsize=(6, 5))
+            #     colors = [plt.cm.tab20(i % 20) for i in range(len(types))]
                 
             #     for tidx in range(len(types)):
             #         mask = (labels_np == tidx)
             #         if mask.sum() > 0:
-            #             fig.add_trace(go.Scatter3d(
-            #                 x=proj_lat[mask, 0],
-            #                 y=proj_lat[mask, 1],
-            #                 z=proj_lat[mask, 2],
-            #                 mode='markers',
-            #                 name=types[tidx],
-            #                 marker=dict(size=5, color=colors_hex[tidx], opacity=0.8)
-            #             ))
+            #             ax.scatter(proj_lat[mask, 0], proj_lat[mask, 1],
+            #                       c=[colors[tidx]], label=types[tidx],
+            #                       s=40, alpha=0.7, edgecolors='k', linewidths=0.5)
                 
-            #     fig.update_layout(
-            #         scene=dict(
-            #             xaxis_title='PC1',
-            #             yaxis_title='PC2',
-            #             zaxis_title='PC3'
-            #         ),
-            #         margin=dict(l=0, r=0, b=0, t=30),
-            #         legend=dict(orientation='h', yanchor='top', y=1.1, xanchor='center', x=0.5)
-            #     )
+            #     ax.set_xlabel('PC1')
+            #     ax.set_ylabel('PC2')
+            #     ax.legend(loc='upper center', bbox_to_anchor=(0.5, 1.12),
+            #              ncol=min(6, len(types)), frameon=False, fontsize=9)
+            #     ax.grid(True, alpha=0.3)
                 
-            #     fname = os.path.join(save_dir, f"latent_pca_{phase}.html")
-            #     fig.write_html(fname)
+            #     fname = os.path.join(save_dir, f"latent_pca_{phase}.svg")
+            #     fig.savefig(fname, bbox_inches='tight')
+            #     plt.close(fig)
             # except Exception as e:
             #     print(f"Latent PCA failed ({phase}): {e}")
             
-            # Latent PCA colored by letter combination (3D interactive)
-            if letter_combos is not None:
-                try:
-                    pca_lat = PCA(n_components=3)
-                    proj_lat = pca_lat.fit_transform(z_np)
+            # # Latent PCA colored by first two letters of sequence (2D static)
+            # if seqs is not None:
+            #     try:
+            #         pca_lat = PCA(n_components=2)
+            #         proj_lat = pca_lat.fit_transform(z_np)
                     
-                    # Get unique letter combinations and assign colors
-                    unique_combos = sorted(set(letter_combos))
-                    combo_to_idx = {combo: idx for idx, combo in enumerate(unique_combos)}
+            #         # Extract first two letters from each sequence
+            #         first_two_letters = [seq[:2] if len(seq) >= 2 else seq for seq in seqs]
+            #         unique_prefixes = sorted(set(first_two_letters))
+            #         prefix_to_idx = {prefix: idx for idx, prefix in enumerate(unique_prefixes)}
                     
-                    # Create interactive plotly 3D scatter
-                    fig = go.Figure()
-                    colors_hex = ['#%02x%02x%02x' % tuple(int(c*255) for c in plt.cm.tab20(i % 20)[:3]) 
-                                  for i in range(len(unique_combos))]
+            #         # Create matplotlib 2D scatter
+            #         fig, ax = plt.subplots(figsize=(6, 5))
+            #         colors = [plt.cm.tab20(i % 20) for i in range(len(unique_prefixes))]
                     
-                    for combo in unique_combos:
-                        mask = np.array([lc == combo for lc in letter_combos])
-                        if mask.sum() > 0:
-                            combo_idx = combo_to_idx[combo]
-                            fig.add_trace(go.Scatter3d(
-                                x=proj_lat[mask, 0],
-                                y=proj_lat[mask, 1],
-                                z=proj_lat[mask, 2],
-                                mode='markers',
-                                name=combo,
-                                marker=dict(size=5, color=colors_hex[combo_idx], opacity=0.8)
-                            ))
+            #         for prefix in unique_prefixes:
+            #             mask = np.array([ftl == prefix for ftl in first_two_letters])
+            #             if mask.sum() > 0:
+            #                 prefix_idx = prefix_to_idx[prefix]
+            #                 ax.scatter(proj_lat[mask, 0], proj_lat[mask, 1], 
+            #                           c=[colors[prefix_idx]], label=prefix, 
+            #                           s=40, alpha=0.7, edgecolors='k', linewidths=0.5)
                     
-                    fig.update_layout(
-                        scene=dict(
-                            xaxis_title='PC1',
-                            yaxis_title='PC2',
-                            zaxis_title='PC3'
-                        ),
-                        margin=dict(l=0, r=0, b=0, t=30),
-                        legend=dict(orientation='h', yanchor='top', y=1.1, xanchor='center', x=0.5)
-                    )
+            #         ax.set_xlabel('PC1')
+            #         ax.set_ylabel('PC2')
+            #         ax.legend(loc='upper center', bbox_to_anchor=(0.5, 1.12), 
+            #                  ncol=min(6, len(unique_prefixes)), frameon=False, fontsize=9)
+            #         ax.grid(True, alpha=0.3)
                     
-                    fname = os.path.join(save_dir, f"latent_pca_by_letters_{phase}.html")
-                    fig.write_html(fname)
-                except Exception as e:
-                    print(f"Latent PCA by letters failed ({phase}): {e}")
+            #         fname = os.path.join(save_dir, f"latent_pca_by_first2_{phase}.svg")
+            #         fig.savefig(fname, bbox_inches='tight')
+            #         plt.close(fig)
+            #     except Exception as e:
+            #         print(f"Latent PCA by first two letters failed ({phase}): {e}")
+            
+            # # Latent PCA colored by letter combination (2D static)
+            # if letter_combos is not None:
+            #     try:
+            #         pca_lat = PCA(n_components=2)
+            #         proj_lat = pca_lat.fit_transform(z_np)
+                    
+            #         # Get unique letter combinations and assign colors
+            #         unique_combos = sorted(set(letter_combos))
+            #         combo_to_idx = {combo: idx for idx, combo in enumerate(unique_combos)}
+                    
+            #         # Create matplotlib 2D scatter
+            #         fig, ax = plt.subplots(figsize=(4, 4))
+            #         colors = [plt.cm.tab20(i % 20) for i in range(len(unique_combos))]
+                    
+            #         for combo in unique_combos:
+            #             mask = np.array([lc == combo for lc in letter_combos])
+            #             if mask.sum() > 0:
+            #                 combo_idx = combo_to_idx[combo]
+            #                 ax.scatter(proj_lat[mask, 0], proj_lat[mask, 1], 
+            #                           c=[colors[combo_idx]], label=combo, 
+            #                           s=30, alpha=0.7, edgecolors='k', linewidths=0.5)
+                    
+            #         ax.set_xlabel('PC1')
+            #         ax.set_ylabel('PC2')
+            #         ax.legend(loc='upper center', bbox_to_anchor=(0.5, 1.15), 
+            #                  ncol=min(5, len(unique_combos)), frameon=False, fontsize=9)
+            #         ax.grid(True, alpha=0.3)
+                    
+            #         fname = os.path.join(save_dir, f"latent_pca_by_letters_{phase}.svg")
+            #         fig.savefig(fname, bbox_inches='tight')
+            #         plt.close(fig)
+            #     except Exception as e:
+            #         print(f"Latent PCA by letters failed ({phase}): {e}")
             
             # Branching PCA (prefix aggregation for encoder
             # if phase == 'test' and hidden_np is not None:
@@ -633,6 +658,15 @@ def run_experiment():
         plot_diagnostics(model, X_train, torch.tensor(labels_train, dtype=torch.long), X_test, test_labels, types, save_dir=SAVE_DIR, history=history, seq_train=seq_train, seq_test=seq_test)
     except Exception as e:
         print(f"plot_diagnostics failed: {e}")
+    
+    # save model weights
+    try:
+        os.makedirs(SAVE_DIR, exist_ok=True)
+        model_path = os.path.join(SAVE_DIR, f'weights_ser_{ENABLE_SERIALIZE_Z}.pth')
+        torch.save(model.state_dict(), model_path)
+        print(f"\nModel weights saved to: {model_path}")
+    except Exception as e:
+        print(f"Failed to save model weights: {e}")
 
 
 if __name__ == '__main__':
