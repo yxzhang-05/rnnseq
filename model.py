@@ -525,14 +525,12 @@ class RNNAutoencoder(nn.Module):
 
         self.encoder = RNNEncoder(d_input, d_hidden, num_layers, d_latent, nonlinearity, device,
             model_filename, from_file, to_freeze, init_weights, layer_type)
-
+        self.projection = nn.Linear(d_hidden, d_latent)
         self.latent = RNN(d_latent, d_latent_hidden, num_layers, d_latent, layer_type=nn.Linear)
 
         # Decoder takes d_latent (8-dim) as input from encoder's h2o output
         self.decoder = RNNDecoder(d_latent, d_hidden, num_layers, d_input, nonlinearity, device,
             init_weights=init_weights, layer_type=layer_type, sequence_length=sequence_length)
-
-
 
     @property
     def h2h (self):
@@ -549,8 +547,10 @@ class RNNAutoencoder(nn.Module):
         else:
             _masking = lambda h: h
 
+        # hidden is the output sequence, latent = hidden[-1]
         hidden, latent = self.encoder(x, delay=self.delay)
-        _, latent_out = self.latent(latent)
+        latent_in = self.projection(hidden)
+        _, latent_out = self.latent(latent_in)
         reconstructed = self.decoder(latent_out, delay=delay)
         return hidden, latent_out, reconstructed
 

@@ -4,6 +4,106 @@ import par_transfer as par
 import scipy.cluster.hierarchy as sch
 from itertools import combinations
 from collections import defaultdict
+from sklearn.decomposition import PCA
+
+######################################################
+# Radial Pattern Score
+######################################################
+
+def radial_pattern_score(latent_points, labels, types, normalize=True, return_components=False):
+   
+    if len(latent_points) < 3:
+        return (0.0, 0.0, 0.0, 0.0) if return_components else 0.0
+    
+    # Identify center line type (abbb pattern) and plane types
+    center_type_idx = None
+    for idx, t in enumerate(types):
+        # Check if pattern is like 'abbb' (one letter appears 3 times, another appears 1 time)
+        letter_counts = {}
+        for c in t:
+            letter_counts[c] = letter_counts.get(c, 0) + 1
+        counts = sorted(letter_counts.values())
+        if counts == [1, 3]:  # abbb pattern
+            center_type_idx = idx
+            break
+    
+    if center_type_idx is None:
+        # Fallback: use type with fewest samples as center
+        unique_labels = np.unique(labels)
+        label_counts = [(l, np.sum(labels == l)) for l in unique_labels]
+        center_type_idx = min(label_counts, key=lambda x: x[1])[0]
+    
+    # Separate center and plane indices
+    center_seq_idx = np.where(labels == center_type_idx)[0].tolist()
+    unique_labels = np.unique(labels)
+    plane_type_indices = {l: np.where(labels == l)[0].tolist() 
+                         for l in unique_labels if l != center_type_idx}
+    
+    # 1. Planarity - compute for each plane type separately
+    # Use PCA explained variance ratio (more stable)
+    planarity_scores = []
+    for type_idx, indices in plane_type_indices.items():
+        if len(indices) < 3:  # Need at least 3 points for meaningful 2D plane
+            continue
+        X_plane = latent_points[indices, :]
+        n_comp = min(2, len(indices), X_plane.shape[1])
+        pca = PCA(n_components=n_comp)
+        pca.fit(X_plane)
+        # Sum of explained variance of top 2 components = planarity
+        plane_score = np.sum(pca.explained_variance_ratio_[:2])
+        planarity_scores.append(plane_score)
+    P = np.mean(planarity_scores) 
+
+    # 2. Centerline Linear Score
+    # Use PCA explained variance ratio for linearity
+    X_center = latent_points[center_seq_idx, :]
+    if len(center_seq_idx) >= 3:  # Need at least 3 points for meaningful line
+        n_comp = min(len(center_seq_idx), X_center.shape[1])
+        pca = PCA(n_components=n_comp)
+        pca.fit(X_center)
+        # First component explained variance = linearity
+        L = pca.explained_variance_ratio_[0]
+    else:
+        L = 0.0
+
+    # 3. Plane-Centerline Distance (Alignment)
+    # Normalize distance by characteristic length scale of data
+    if len(center_seq_idx) >= 3 and plane_type_indices:
+        center_mean = np.mean(X_center, axis=0)
+        pca_center = PCA(n_components=1)
+        pca_center.fit(X_center)
+        line_vec = pca_center.components_[0]
+        
+        # Compute characteristic scale: std of all points
+        data_scale = np.std(latent_points) + 1e-8
+        
+        align_scores = []
+        for type_idx, indices in plane_type_indices.items():
+            if len(indices) < 1:
+                continue
+            X_plane = latent_points[indices, :]
+            plane_center = np.mean(X_plane, axis=0)
+            
+            # Distance from plane center to line
+            vec_to_plane = plane_center - center_mean
+            proj_len = np.dot(vec_to_plane, line_vec)
+            closest_point = center_mean + proj_len * line_vec
+            dist = np.linalg.norm(plane_center - closest_point)
+            
+            # Normalize by data scale and invert (smaller distance = better)
+            normalized_dist = dist / data_scale
+            align_score = np.exp(-normalized_dist)  # Exponential decay: 0 dist -> 1, large dist -> 0
+            align_scores.append(align_score)
+        A = np.mean(align_scores) if align_scores else 0.0
+    else:
+        A = 0.0
+    A = np.clip(A, 0, 1)
+
+    # Overall score
+    radial_score = (P + L + A) / 3.0
+    
+    return radial_score, P, L, A
+
 
 ######################################################
 # Dot product of the representations in hidden layer #
