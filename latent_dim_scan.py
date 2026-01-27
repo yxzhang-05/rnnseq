@@ -2,7 +2,7 @@ import random
 import numpy as np
 import torch
 import torch.nn.functional as F
-from model import RNNAutoencoder
+from model import RNN
 from sequences import findStructures, replace_symbols as seq_replace_symbols
 import string
 import itertools
@@ -16,14 +16,12 @@ from analysis_utils import radial_pattern_score
 L, m, alpha = 4, 2, 6
 epochs = 1000
 lr = 1e-3
-d_hidden = 8
-d_latent_hidden = 4
 weight_decay = 1e-3
 num_layers = 1
 device = torch.device('cpu')
 
-# Scan parameters
-d_latent_values = [1, 2, 4, 8, 16, 32, 64]
+# Scan参数：d_hidden
+d_hidden_values = [2, 4, 8, 16, 32, 64, 128]
 seeds = list(range(10))  # 10 different seeds
 
 SAVE_DIR = "results/latent_dim_scan"
@@ -87,7 +85,7 @@ def train_model(model, X_train, X_test, test_labels, train_labels, types, n_epoc
         model.train()
         optimizer.zero_grad()
 
-        hidden, latent, output = model(X_train)
+        hidden, output = model(X_train)
         ce_loss = F.cross_entropy(
             output.reshape(-1, output.shape[-1]),
             torch.argmax(X_train, dim=-1).reshape(-1)
@@ -99,33 +97,33 @@ def train_model(model, X_train, X_test, test_labels, train_labels, types, n_epoc
     # Final evaluation
     model.eval()
     with torch.no_grad():
-        _, train_latent, train_output = model(X_train)
+        train_hidden, train_output = model(X_train)
         pred_train = torch.argmax(train_output, dim=-1)
         target_train = torch.argmax(X_train, dim=-1)
         train_acc = (pred_train == target_train).all(dim=0).float().mean().item()
 
-        _, test_latent, test_output = model(X_test)
+        test_hidden, test_output = model(X_test)
         pred_test = torch.argmax(test_output, dim=-1)
         target_test = torch.argmax(X_test, dim=-1)
         test_acc = (pred_test == target_test).all(dim=0).float().mean().item()
 
-        # Compute radial scores
-        if train_latent.ndim == 3:
-            train_latent_2d = train_latent.permute(1, 0, 2).reshape(train_latent.shape[1], -1)
-            test_latent_2d = test_latent.permute(1, 0, 2).reshape(test_latent.shape[1], -1)
+        # Compute radial scores using hidden states
+        if train_hidden.ndim == 3:
+            train_hidden_2d = train_hidden.permute(1, 0, 2).reshape(train_hidden.shape[1], -1)
+            test_hidden_2d = test_hidden.permute(1, 0, 2).reshape(test_hidden.shape[1], -1)
         else:
-            train_latent_2d = train_latent
-            test_latent_2d = test_latent
+            train_hidden_2d = train_hidden
+            test_hidden_2d = test_hidden
 
-        train_latent_np = train_latent_2d.cpu().numpy()
-        test_latent_np = test_latent_2d.cpu().numpy()
+        train_hidden_np = train_hidden_2d.cpu().numpy()
+        test_hidden_np = test_hidden_2d.cpu().numpy()
         train_labels_np = train_labels.cpu().numpy()
         test_labels_np = test_labels.cpu().numpy()
 
         train_radial, train_P, train_L, train_A = radial_pattern_score(
-            train_latent_np, train_labels_np, types, return_components=True)
+            train_hidden_np, train_labels_np, types, return_components=True)
         test_radial, test_P, test_L, test_A = radial_pattern_score(
-            test_latent_np, test_labels_np, types, return_components=True)
+            test_hidden_np, test_labels_np, types, return_components=True)
 
     return {
         'train_acc': train_acc,
@@ -144,14 +142,14 @@ def train_model(model, X_train, X_test, test_labels, train_labels, types, n_epoc
 def run_scan():
     results = []
 
-    total_runs = len(d_latent_values) * len(seeds)
+    total_runs = len(d_hidden_values) * len(seeds)
     current_run = 0
 
-    for d_latent in d_latent_values:
+    for d_hidden in d_hidden_values:
         for seed in seeds:
             current_run += 1
             print(f"\n{'='*60}")
-            print(f"Run {current_run}/{total_runs}: d_latent={d_latent}, seed={seed}")
+            print(f"Run {current_run}/{total_runs}: d_hidden={d_hidden}, seed={seed}")
             print(f"{'='*60}")
 
             set_seed(seed)
@@ -165,8 +163,14 @@ def run_scan():
             test_labels = torch.tensor(labels_test, dtype=torch.long)
 
             # Create model
-            model = RNNAutoencoder(
-                alpha, d_hidden, d_latent_hidden, num_layers, d_latent, L
+            model = RNN(
+                d_input=alpha,
+                d_hidden=d_hidden,
+                num_layers=num_layers,
+                d_output=alpha,
+                output_activation=None,
+                nonlinearity='relu',
+                device=device
             ).to(device)
 
             # Train and evaluate
@@ -177,7 +181,7 @@ def run_scan():
 
             # Store results
             result = {
-                'd_latent': d_latent,
+                'd_hidden': d_hidden,
                 'seed': seed,
                 **metrics
             }
@@ -199,71 +203,49 @@ def plot_results(df):
     """Plot results with error bars for both train and test"""
     
     # Metrics to plot: acc, radial and its three components
+    # 只画accuracy和radial
     metrics_to_plot = [
         ('acc', 'Accuracy'),
         ('radial', 'Radial Score (P+L+A)/3'),
-        ('P', 'Planarity (P)'),
-        ('L', 'Linearity (L)'),
-        ('A', 'Alignment (A)'),
     ]
-    
-    # Colors matching phase_scan.py
     metric_colors = {
-        'acc': '#2c3e50',  # Dark blue-gray for accuracy
-        'P': '#1f77b4',  # Blue
-        'L': '#ff7f0e',  # Orange
-        'A': '#2ca02c',  # Green
-        'radial': '#9467bd'  # Purple for average
+        'acc': '#2c3e50',
+        'radial': '#9467bd'
     }
-
-    fig, axes = plt.subplots(1, 5, figsize=(20, 4))
-
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
     for idx, (metric, label) in enumerate(metrics_to_plot):
         ax = axes[idx]
-        
-        # Plot both train and test with distinct styles
         for phase, linestyle, marker, alpha_val in [
-            ('train', '-', 'o', 0.7), 
+            ('train', '-', 'o', 0.7),
             ('test', '--', 's', 0.9)
         ]:
             full_metric = f'{phase}_{metric}'
-            grouped = df.groupby('d_latent')[full_metric]
+            grouped = df.groupby('d_hidden')[full_metric]
             means = grouped.mean()
             stds = grouped.std()
-            
-            d_latent_vals = means.index.values
-            
-            # Use metric-specific color
+            d_hidden_vals = means.index.values
             color = metric_colors.get(metric, '#333333')
-            
-            # Plot with error bars
-            ax.errorbar(d_latent_vals, means.values, yerr=stds.values, 
+            ax.errorbar(d_hidden_vals, means.values, yerr=stds.values,
                        marker=marker, linewidth=2.5, markersize=8, capsize=5, capthick=2,
                        color=color, label=phase.capitalize(), alpha=alpha_val,
                        linestyle=linestyle)
-        
-        ax.set_xlabel('$d_{latent}$', fontsize=13, fontweight='bold')
+        ax.set_xlabel('$d_{hidden}$', fontsize=13, fontweight='bold')
         ax.set_ylabel(label.split('(')[0].strip(), fontsize=12)
-        ax.set_title(label, fontsize=13, fontweight='bold', 
-                    color=metric_colors.get(metric, 'black'))
+        ax.set_title(label, fontsize=13, fontweight='bold', color=metric_colors.get(metric, 'black'))
         ax.grid(True, alpha=0.3, linestyle=':', linewidth=0.8)
         ax.set_xscale('log', base=2)
-        ax.set_xticks(d_latent_vals)
-        ax.set_xticklabels([str(int(x)) for x in d_latent_vals])
+        ax.set_xticks(d_hidden_vals)
+        ax.set_xticklabels([str(int(x)) for x in d_hidden_vals])
         ax.legend(loc='best', fontsize=10, frameon=True, fancybox=True, shadow=True)
         ax.set_ylim([0, 1.05])
-    
     plt.tight_layout()
     plot_path = os.path.join(SAVE_DIR, "scan_results.svg")
     fig.savefig(plot_path, bbox_inches='tight', dpi=150)
     plt.close(fig)
-    
     print(f"Plots saved to {plot_path}")
-
-    # Also create a summary table for both train and test
-    summary_metrics = ['train_acc', 'test_acc', 'train_radial', 'test_radial', 
-                      'train_P', 'test_P', 'train_L', 'test_L', 'train_A', 'test_A']
-    summary = df.groupby('d_latent')[summary_metrics].agg(['mean', 'std'])
+    # 也保存summary表
+    summary_metrics = ['train_acc', 'test_acc', 'train_radial', 'test_radial']
+    summary = df.groupby('d_hidden')[summary_metrics].agg(['mean', 'std'])
     summary_path = os.path.join(SAVE_DIR, "summary.csv")
     summary.to_csv(summary_path)
     print(f"Summary saved to {summary_path}")
@@ -272,12 +254,10 @@ def plot_results(df):
 
 
 if __name__ == '__main__':
-    print("Starting latent dimension scan...")
-    print(f"d_latent values: {d_latent_values}")
+    print("Starting hidden dimension scan...")
+    print(f"d_hidden values: {d_hidden_values}")
     print(f"Seeds: {seeds}")
-    print(f"Total runs: {len(d_latent_values) * len(seeds)}")
-    
+    print(f"Total runs: {len(d_hidden_values) * len(seeds)}")
     df = run_scan()
     plot_results(df)
-    
     print("\n\nScan complete!")

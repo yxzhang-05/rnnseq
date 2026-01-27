@@ -500,12 +500,13 @@ class RNNDecoder(nn.Module):
         # Expand the latent vector to match the sequence length, fill with zeros
         # filled_tensor = torch.zeros_like(latent_expanded)
         # filled_tensor[0,:] = latent
+        latent_expanded = latent.unsqueeze(0).repeat(self.sequence_length, 1, 1)
 
-        rnn_out, output = self.rnn(latent, delay=0)
+        rnn_out, output = self.rnn(latent_expanded, delay=0)
         return output
 
 class RNNAutoencoder(nn.Module):
-    def __init__(self, d_input, d_hidden, d_latent_hidden, num_layers, d_latent, sequence_length,
+    def __init__(self, d_input, d_hidden, num_layers, d_latent, sequence_length,
             nonlinearity='relu',
             device="cpu",
             model_filename=None, # file with model parameters
@@ -517,16 +518,16 @@ class RNNAutoencoder(nn.Module):
 
         self.d_input = d_input
         self.d_hidden = d_hidden
-        self.d_latent = d_latent
-        self.d_latent_hidden = d_latent_hidden  
+        self.d_latent = d_latent 
         self.num_layers = num_layers
         self.sequence_length = sequence_length
         self.device = device
 
         self.encoder = RNNEncoder(d_input, d_hidden, num_layers, d_latent, nonlinearity, device,
             model_filename, from_file, to_freeze, init_weights, layer_type)
-        self.projection = nn.Linear(d_hidden, d_latent)
-        self.latent = RNN(d_latent, d_latent_hidden, num_layers, d_latent, layer_type=nn.Linear)
+
+        self.latent = RNN(d_hidden, d_latent, nonlinearity=nonlinearity, device=device, 
+                               init_weights=init_weights, layer_type=layer_type)
 
         # Decoder takes d_latent (8-dim) as input from encoder's h2o output
         self.decoder = RNNDecoder(d_latent, d_hidden, num_layers, d_input, nonlinearity, device,
@@ -547,10 +548,19 @@ class RNNAutoencoder(nn.Module):
         else:
             _masking = lambda h: h
 
-        # hidden is the output sequence, latent = hidden[-1]
-        hidden, latent = self.encoder(x, delay=self.delay)
-        latent_in = self.projection(hidden)
-        _, latent_out = self.latent(latent_in)
+        # Encoder: x -> (hidden, latent_input)
+        # hidden: (seq_len, batch_size, d_hidden)
+        # latent_input: (seq_len, batch_size, d_latent) from encoder's h2o
+        hidden, latent_input = self.encoder(x, delay=self.delay)
+        
+        # Latent RNN: processes the hidden activity sequence
+        # Input: hidden (seq_len, batch_size, d_hidden)
+        # Output: latent_out (batch_size, d_latent) - final time step only
+        _, latent_out = self.latent(hidden)
+        
+        # Decoder: latent_out -> reconstructed
+        # latent_out: (batch_size, d_latent)
+        # reconstructed: (seq_len, batch_size, d_input)
         reconstructed = self.decoder(latent_out, delay=delay)
         return hidden, latent_out, reconstructed
 
