@@ -44,8 +44,14 @@ def run_acc_vs_weight_experiment():
             torch.manual_seed(seed)
 
             model = RNNAutoencoder(
-                alpha, d_hidden, 1, d_latent, L,
-                enable_serialize=ser
+                d_input=alpha,
+                d_hidden=d_hidden,
+                d_latent_hidden=(4 if ser else 1),
+                num_layers=1,
+                d_latent=d_latent,
+                sequence_length=L,
+                nonlinearity='relu',
+                device=device,
             ).to(device)
 
             # now generate data (same seed -> same data across runs)

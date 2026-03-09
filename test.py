@@ -11,20 +11,21 @@ from sklearn.decomposition import PCA
 import matplotlib.pyplot as plt
 import plotly.graph_objects as go
 import os
-from analysis_utils import radial_pattern_score
+from analysis_utils import radial_pattern_score, compute_umcontent, compute_distance
 
 
-seed = 42
+seed = 40
 L, m, alpha = 4, 2, 6
 epochs = 1000 
 lr = 1e-3
-d_hidden = 16
-d_latent = 4
-d_latent_hidden = 8
+d_hidden = 8
+d_latent = 2
+d_latent_hidden = 4
 weight_decay = 1e-3 
 num_layers = 1
 device = torch.device('cpu')
 SAVE_DIR = "results"
+TRAIN_PRINT_FINAL = True
 
 def set_seed(seed):
     random.seed(seed)
@@ -42,25 +43,23 @@ def generate_instances(alpha, L, m, frac_train=0.8):
     train_seqs, test_seqs = [], []
     train_labels, test_labels = [], []
 
-    for type_idx, t in enumerate(types):
-        # generate sequences for this type
-        seqs = [seq_replace_symbols(t, perm) for perm in all_perms]
+    for type_idx in range(len(types)):
+        t = types[type_idx]
+        all_type_seqs = [seq_replace_symbols(t, perm) for perm in all_perms]
 
-        # shuffle and split
-        n = len(seqs)
-        perm_idx = np.random.permutation(n)
+        n = len(all_type_seqs)
         split = int(frac_train * n)
-
+        perm_idx = np.random.permutation(n)
         train_idx = perm_idx[:split]
-        test_idx  = perm_idx[split:]
+        test_idx = perm_idx[split:]
 
-        # append train
-        train_seqs.extend([seqs[i] for i in train_idx])
-        train_labels.extend([type_idx] * len(train_idx))
+        train_type_seqs = [all_type_seqs[i] for i in train_idx]
+        test_type_seqs = [all_type_seqs[i] for i in test_idx]
 
-        # append test
-        test_seqs.extend([seqs[i] for i in test_idx])
-        test_labels.extend([type_idx] * len(test_idx))
+        train_seqs.extend(train_type_seqs)
+        test_seqs.extend(test_type_seqs)
+        train_labels.extend([type_idx] * len(train_type_seqs))
+        test_labels.extend([type_idx] * len(test_type_seqs))
 
     return (np.array(train_seqs), np.array(test_seqs), np.array(train_labels), np.array(test_labels), types)
 
@@ -79,184 +78,386 @@ def sequences_to_tensor(sequences, alpha):
     return one_hot.permute(1, 0, 2)
 
 
-def plot_diagnostics(model, X_train, train_labels, X_test, test_labels, types, save_dir=SAVE_DIR, history=None, seq_train=None, seq_test=None):
+# -------------------------------------------------------
+#                Representation Geometry
+# -------------------------------------------------------
 
+def trajectory_pca_latent(model, X_train, seq_train, save_dir=SAVE_DIR):
     os.makedirs(save_dir, exist_ok=True)
 
-    def _safe_numpy(t):
-        return t.cpu().numpy() if isinstance(t, torch.Tensor) else np.array(t)
-
-    model.eval()
     with torch.no_grad():
-        h_tr, enc_lat_tr = model.encoder(X_train)
-        h_te, enc_lat_te = model.encoder(X_test)
+        _, enc_lat = model.encoder(X_train)
+        lat_hidden, _ = model.latent(enc_lat)
 
-    datasets = [
-        (h_tr, enc_lat_tr, train_labels, 'train', seq_train),
-        (h_te, enc_lat_te, test_labels, 'test', seq_test)
+    # lat_hidden: [T, B, H] -> [(T*B), H]
+    hidden_np = lat_hidden.detach().cpu().numpy()
+    t_steps, batch_size, hidden_dim = hidden_np.shape
+    hidden_flat = hidden_np.reshape(t_steps * batch_size, hidden_dim)
+
+    # PCA on all hidden states, then reshape back to [T, B, 2].
+    pca = PCA(n_components=2)
+    hidden_2d_flat = pca.fit_transform(hidden_flat)
+    hidden_2d = hidden_2d_flat.reshape(t_steps, batch_size, 2)
+
+    seq_chars = np.asarray([list(s) for s in np.asarray(seq_train)])
+    if seq_chars.shape[1] != t_steps:
+        # Keep plotting robust if sequence length and hidden timesteps differ.
+        t_plot = min(seq_chars.shape[1], t_steps)
+        hidden_2d = hidden_2d[:t_plot]
+        t_steps = t_plot
+        seq_chars = seq_chars[:, :t_plot]
+
+    letters = np.unique(seq_chars)
+    cmap = plt.get_cmap('tab10', max(len(letters), 1))
+    color_map = {letter: cmap(i) for i, letter in enumerate(letters)}
+
+    plt.figure(figsize=(3, 3.5))
+    for b in range(batch_size):
+        xy = hidden_2d[:, b, :]
+        if t_steps <= 1:
+            plt.plot(xy[:, 0], xy[:, 1], color='0.6', linewidth=1.0, alpha=0.6, zorder=1)
+            continue
+
+        # Use a light-to-dark gradient to indicate trajectory direction (start -> end).
+        for t in range(t_steps - 1):
+            frac = t / max(t_steps - 2, 1)
+            alpha = 0.2 + 0.65 * frac
+            gray = 0.85 - 0.45 * frac
+            plt.plot(xy[t:t + 2, 0], xy[t:t + 2, 1], color=(gray, gray, gray),
+                    linewidth=1.0, alpha=alpha, zorder=1)
+
+    for t in range(t_steps):
+        letters_t = seq_chars[:, t]
+        point_colors = [color_map[ch] for ch in letters_t]
+        size = 12 + 2.5 * t
+        alpha_t = 0.35 + 0.55 * (t / max(t_steps - 1, 1))
+        plt.scatter(
+            hidden_2d[t, :, 0],
+            hidden_2d[t, :, 1],
+            c=point_colors,
+            s=size,
+            marker='o',
+            alpha=alpha_t,
+            edgecolors='white',
+            linewidths=0.4,
+            zorder=3,
+        )
+
+    legend_handles = []
+    for letter in letters:
+        handle = plt.Line2D([0], [0], color=color_map[letter], marker='o', lw=0, markersize=5, label=str(letter))
+        legend_handles.append(handle)
+
+    plt.xlabel(f'PC1 ({pca.explained_variance_ratio_[0] * 100:.1f}%)')
+    plt.ylabel(f'PC2 ({pca.explained_variance_ratio_[1] * 100:.1f}%)')
+    plt.grid(True, alpha=0.3)
+    plt.legend(
+        handles=legend_handles,
+        fontsize=8,
+        ncol=3,
+        loc='upper center',
+        bbox_to_anchor=(0.5, 1.22),
+        frameon=False,
+    )
+    plt.tight_layout(rect=[0, 0, 1, 0.9])
+    plt.savefig(os.path.join(save_dir, 'latent_trajectory_pca_train.svg'), dpi=200)
+    plt.close()
+
+
+#  -------------------------------------------------------
+#                 Connnectivity Structure
+#  -------------------------------------------------------
+                   
+# Singular Value Curves
+def singular_value_curve(model, save_dir=SAVE_DIR):
+    os.makedirs(save_dir, exist_ok=True)
+
+    recurrent_blocks = [
+        ('encoder', model.encoder.rnn.h2h),
+        ('latent', model.latent.h2h),
+        ('decoder', model.decoder.rnn.h2h),
     ]
 
-    for hidden, enc_lat, labels, phase, seqs in datasets:
-        labels_np = _safe_numpy(labels)
-        if enc_lat is not None:
-            _, latent_out = model.latent(enc_lat)
-        else:
-            latent_out = None
-        latent_out_np = latent_out.detach().cpu().numpy() if latent_out is not None else None
+    plt.figure(figsize=(3.5, 3))
 
-        # Use latent output sequence for PCA: (Seq_Len, Batch, Dim) -> (Batch, Seq_Len*Dim)
-        if latent_out_np is not None and latent_out_np.ndim == 3:
-            latent_out_flat = latent_out_np.transpose(1, 0, 2).reshape(latent_out_np.shape[1], -1)
-        else:
-            latent_out_flat = latent_out_np
+    for name, recurrent_layer in recurrent_blocks:
+        w = recurrent_layer.weight.detach().cpu()
+        singular_values = torch.linalg.svdvals(w).numpy()
+        x = np.arange(1, singular_values.shape[0] + 1)
+        plt.plot(x, singular_values, marker='o', linewidth=1.5, markersize=3, label=name)
 
-        # Extract letter combinations
-        letter_combos = None
-        if seqs is not None:
-            letter_combos = [''.join(sorted(set(seq))) for seq in seqs]
+    plt.xlabel('Index')
+    plt.ylabel('Singular value')
+    plt.title('Singular Value Curves')
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, 'singular_value_curves.svg'), dpi=200)
+    plt.close()
 
-        # Color by type
-        unique_types = range(len(types)) if types is not None else np.unique(labels_np)
 
-        # =======================================================
-        # 1. Latent output (all timesteps) PCA Spectrum (Global) - Uses latent_out_flat
-        # =======================================================
-        try:
-            n_comp = min(latent_out_flat.shape[1], latent_out_flat.shape[0] - 1, 10)
-            n_comp = max(1, n_comp)
+# Effective Dimensionality 
+def hidden_dimensionality(model, X, save_dir=SAVE_DIR, eps=1e-12):
+    os.makedirs(save_dir, exist_ok=True)
 
-            pca_lat = PCA(n_components=n_comp)
-            pca_lat.fit(latent_out_flat)
-            evr_lat = pca_lat.explained_variance_ratio_
+    with torch.no_grad():
+        enc_hidden, enc_lat = model.encoder(X)
+        lat_hidden, lat_out = model.latent(enc_lat)
+        dec_hidden, _ = model.decoder.rnn(lat_out)
 
-            fig, ax = plt.subplots(figsize=(3, 3))
-            ax.bar(range(1, len(evr_lat)+1), evr_lat, color='C1')
-            ax.set_xlabel('PC')
-            ax.set_ylabel('Explained variance ratio')
-            ax.set_title(f'{phase.capitalize()}')
-            fname = os.path.join(save_dir, f"latent_output_all_pca_spectrum_{phase}.svg")
-            fig.savefig(fname, bbox_inches='tight')
-            plt.close(fig)
-        except Exception as e:
-            print(f"Latent output all-timesteps PCA spectrum failed ({phase}): {e}")
+    block_hidden = {
+        'encoder': enc_hidden.detach().cpu().numpy(),
+        'latent': lat_hidden.detach().cpu().numpy(),
+        'decoder': dec_hidden.detach().cpu().numpy(),
+    }
 
-        # =======================================================
-        # 2. Latent output (all timesteps) PCA Scatter 2D (PC1-PC2) - Uses latent_out_flat
-        # =======================================================
-        try:
-            n_components = min(3, latent_out_flat.shape[0] - 1, latent_out_flat.shape[1])
-            n_components = max(2, n_components)
+    plt.figure(figsize=(3.5, 3))
+    for block_name, hidden_np in block_hidden.items():
+        time_steps = hidden_np.shape[0]
+        x = np.arange(1, time_steps + 1)
 
-            pca_lat = PCA(n_components=n_components)
-            proj_lat = pca_lat.fit_transform(latent_out_flat)
+        d90_values = []
+        for t in range(time_steps):
+            states_t = hidden_np[t, :, :]
+            if states_t.shape[0] < 2:
+                d90_values.append(np.nan)
+                continue
 
-            fig, ax = plt.subplots(figsize=(4, 4))
-            group_count = len(types)
-            colors = plt.cm.tab20(np.linspace(0, 1, group_count))
-            for tidx in range(len(types)):
-                mask = (labels_np == tidx)
-                if mask.sum() > 0:
-                    ax.scatter(proj_lat[mask, 0], proj_lat[mask, 1],
-                                c=[colors[tidx]], s=50, alpha=0.8,
-                                label=types[tidx], edgecolors='none')
-            ax.legend(loc='upper center', bbox_to_anchor=(0.5, 1.2), ncol=int(np.ceil(len(types)/2)), frameon=False, fontsize=9)
+            centered = states_t - states_t.mean(axis=0, keepdims=True)
+            singular_values = np.linalg.svd(centered, compute_uv=False)
+            explained = singular_values ** 2
+            total = explained.sum()
+            if total <= eps:
+                d90_values.append(0)
+                continue
 
-            ax.set_xlabel('PC1', fontsize=11)
-            ax.set_ylabel('PC2', fontsize=11)
-            ax.grid(True, alpha=0.2)
+            cumulative = np.cumsum(explained) / total
+            d90_values.append(int(np.searchsorted(cumulative, 0.9) + 1))
 
-            fname = os.path.join(save_dir, f"latent_output_all_pca_12_{phase}.svg")
-            fig.savefig(fname, bbox_inches='tight')
-            plt.close(fig)
-        except Exception as e:
-            print(f"Latent output all-timesteps PCA PC1-PC2 failed ({phase}): {e}")
+        plt.plot(x, d90_values, marker='o', linewidth=1.5, markersize=3, label=block_name)
 
-        # =======================================================
-        # 3. Latent output (all timesteps) PCA Scatter 2D (PC2-PC3) - Uses latent_out_flat
-        # =======================================================
-        try:
-            n_components = min(3, latent_out_flat.shape[0] - 1, latent_out_flat.shape[1])
-            n_components = max(3, n_components)
+    plt.xlabel('Timestep')
+    plt.ylabel('d90')
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, 'hidden_d90.svg'), dpi=200)
+    plt.close()
 
-            pca_lat = PCA(n_components=n_components)
-            proj_lat = pca_lat.fit_transform(latent_out_flat)
 
-            fig, ax = plt.subplots(figsize=(4, 4))
-            group_count = len(types)
-            colors = plt.cm.tab20(np.linspace(0, 1, group_count))
-            for tidx in range(len(types)):
-                mask = (labels_np == tidx)
-                if mask.sum() > 0:
-                    ax.scatter(proj_lat[mask, 1], proj_lat[mask, 2],
-                              c=[colors[tidx]], s=50, alpha=0.8,
-                              label=types[tidx], edgecolors='none')
-            ax.legend(loc='upper center', bbox_to_anchor=(0.5, 1.2), ncol=int(np.ceil(len(types)/2)), frameon=False, fontsize=9)
+# -------------------------------------------------------
+#               Representation Structure
+# -------------------------------------------------------
+def _latent_hidden_numpy(model, X):
+    with torch.no_grad():
+        _, enc_lat = model.encoder(X)
+        lat_hidden, _ = model.latent(enc_lat)
+    return lat_hidden.detach().cpu().numpy().astype(np.float64)
 
-            ax.set_xlabel('PC2', fontsize=11)
-            ax.set_ylabel('PC3', fontsize=11)
-            ax.grid(True, alpha=0.2)
 
-            fname = os.path.join(save_dir, f"latent_output_all_pca_23_{phase}.svg")
-            fig.savefig(fname, bbox_inches='tight')
-            plt.close(fig)
-        except Exception as e:
-            print(f"Latent output all-timesteps PCA PC2-PC3 failed ({phase}): {e}")
+def Euclidean_matrix(model, X_train, seq_train, save_dir=SAVE_DIR, latent_hidden_list=None):
+    os.makedirs(save_dir, exist_ok=True)
 
-        # =======================================================
-        # 4. Latent output (all timesteps) PCA 3D (PC1-PC2-PC3) by Type - Uses latent_out_flat
-        # =======================================================
-        try:
-            n_components = min(3, latent_out_flat.shape[0], latent_out_flat.shape[1])
-            pca_lat = PCA(n_components=n_components)
-            proj_lat = pca_lat.fit_transform(latent_out_flat)
+    if latent_hidden_list is None or len(latent_hidden_list) == 0:
+        latent_hidden_list = [_latent_hidden_numpy(model, X_train)]
 
-            fig = go.Figure()
-            group_count = len(types)
-            colors = plt.cm.tab20(np.linspace(0, 1, group_count))
-            colors_hex = ['#%02x%02x%02x' % tuple(int(c*255) for c in colors[i][:3])
-                          for i in range(group_count)]
-            for tidx in range(len(types)):
-                mask = (labels_np == tidx)
-                if mask.sum() > 0:
-                    x = proj_lat[mask, 0]
-                    y = proj_lat[mask, 1] if n_components > 1 else np.zeros(mask.sum())
-                    z = proj_lat[mask, 2] if n_components > 2 else np.zeros(mask.sum())
+    seq_train = np.asarray(seq_train)
+    seq_chars = np.asarray([list(s) for s in seq_train])
+    seq_len = seq_chars.shape[1]
+    t_steps = min(latent_hidden_list[0].shape[0], seq_len)
 
-                    if seqs is not None:
-                        seq_labels = [seqs[i] for i in range(len(labels_np)) if labels_np[i] == tidx]
-                    else:
-                        seq_labels = None
+    n_show = min(4, t_steps)
+    if n_show == 0:
+        return
 
-                    fig.add_trace(go.Scatter3d(
-                        x=x, y=y, z=z,
-                        mode='markers+text',
-                        name=types[tidx],
-                        text=seq_labels,
-                        textposition='top center',
-                        textfont=dict(size=8),
-                        marker=dict(size=5, color=colors_hex[tidx], opacity=0.8)
-                    ))
+    panel_data = []
+    max_dist = 0.0
+    for t in range(n_show):
+        dist_acc = None
+        for hidden_np in latent_hidden_list:
+            z_t = hidden_np[t]
+            deltas = z_t[:, None, :] - z_t[None, :, :]
+            euclidean_dist = np.linalg.norm(deltas, axis=-1)
+            if dist_acc is None:
+                dist_acc = euclidean_dist
+            else:
+                dist_acc = dist_acc + euclidean_dist
+        euclidean_dist = dist_acc / float(len(latent_hidden_list))
+        max_dist = max(max_dist, float(np.max(euclidean_dist)))
 
-            fig.update_layout(
-                title=f"Latent output (all timesteps) PCA by Type ({phase}) - {n_components} components",
-                scene=dict(
-                    xaxis_title='PC1',
-                    yaxis_title='PC2' if n_components > 1 else 'PC2 (N/A)',
-                    zaxis_title='PC3' if n_components > 2 else 'PC3 (N/A)'
-                ),
-                margin=dict(l=0, r=0, b=0, t=30),
-                legend=dict(orientation='h', yanchor='top', y=1.1, xanchor='center', x=0.5)
-            )
+        chars_t = seq_chars[:, t]
+        order = np.argsort(chars_t, kind='stable')
+        distance_sorted = euclidean_dist[order][:, order]
+        chars_sorted = chars_t[order]
 
-            fname = os.path.join(save_dir, f"latent_output_all_pca_{phase}.html")
-            fig.write_html(fname)
-        except Exception as e:
-            print(f"Latent output all-timesteps PCA 3D failed ({phase}): {e}")
+        unique_chars = np.unique(chars_sorted)
+        boundaries = []
+        centers = []
+        group_labels = []
+        start = 0
+        for c in unique_chars:
+            idx = np.where(chars_sorted == c)[0]
+            end = idx[-1] + 1
+            boundaries.append(end)
+            centers.append((start + end - 1) / 2.0)
+
+            # Example labels by timestep
+            group_labels.append('-' * t + c + '-' * (seq_len - t - 1))
+            start = end
+
+        panel_data.append((t, distance_sorted, boundaries, centers, group_labels))
+
+    fig, axes = plt.subplots(1, 4, figsize=(16.8, 5.0))
+    axes = np.atleast_1d(axes)
+    shared_im = None
+
+    for i, (t, distance_sorted, boundaries, centers, group_labels) in enumerate(panel_data):
+        ax = axes[i]
+        shared_im = ax.imshow(
+            distance_sorted,
+            cmap='viridis',
+            interpolation='nearest',
+            aspect='equal',
+            vmin=0,
+            vmax=max_dist if max_dist > 0 else 1.0,
+        )
+        ax.set_box_aspect(1)
+
+        for b in boundaries[:-1]:
+            ax.axhline(b - 0.5, color='black', linewidth=0.8, alpha=0.7)
+            ax.axvline(b - 0.5, color='black', linewidth=0.8, alpha=0.7)
+
+        ax.set_xticks(centers)
+        ax.set_xticklabels(group_labels, rotation=45, ha='right', fontsize=13)
+        ax.set_yticks(centers)
+        ax.set_yticklabels(group_labels, fontsize=13)
+        ax.set_xlabel(f't{t + 1}', fontsize=16, labelpad=10)
+
+    # Hide unused axes if sequence length < 4.
+    for j in range(n_show, len(axes)):
+        axes[j].axis('off')
+
+    fig.subplots_adjust(right=0.9, wspace=0.3, top=0.92, bottom=0.18)
+    cbar_ax = fig.add_axes([0.915, 0.2, 0.009, 0.62])
+    cbar = fig.colorbar(shared_im, cax=cbar_ax)
+    cbar.set_label('Euclidean distance', fontsize=14)
+    cbar.ax.tick_params(labelsize=11)
+    fig.savefig(os.path.join(save_dir, 'euclidean_matrix_train.svg'), dpi=200)
+    plt.close(fig)
+
+
+def plot_euclidean_matrix(model, X_train, seq_train, X_test, test_labels, train_labels, types, save_dir=SAVE_DIR, ensemble_seeds=None):
     
+    if ensemble_seeds is None:
+        Euclidean_matrix(model, X_train, seq_train, save_dir=save_dir, latent_hidden_list=None)
+        return
+
+    global TRAIN_PRINT_FINAL
+
+    latent_hidden_list = []
+    ensemble_metrics = {'train_loss': [], 'test_loss': [], 'train_acc': [], 'test_acc': [], 'train_radial': [], 'test_radial': []}
+    prev_print_state = TRAIN_PRINT_FINAL
+    TRAIN_PRINT_FINAL = False
+    for s in ensemble_seeds:
+        set_seed(s)
+        model_seed = RNNAutoencoder(alpha, d_hidden, d_latent_hidden, num_layers, d_latent, L).to(device)
+        history_seed = train(model_seed, X_train, X_test, test_labels, train_labels=train_labels, types=types, n_epochs=epochs, lr=lr, weight_decay=weight_decay)
+        for key in ensemble_metrics:
+            if len(history_seed[key]) > 0:
+                ensemble_metrics[key].append(history_seed[key][-1])
+        latent_hidden_list.append(_latent_hidden_numpy(model_seed, X_train))
+    TRAIN_PRINT_FINAL = prev_print_state
+
+    if len(ensemble_metrics['train_loss']) > 0:
+        print('\nEuclidean ensemble mean over seeds:')
+        print(f"  Train - Loss: {np.mean(ensemble_metrics['train_loss']):.4f}, Acc: {np.mean(ensemble_metrics['train_acc']):.4f}, Radial: {np.mean(ensemble_metrics['train_radial']):.4f}")
+        print(f"  Test  - Loss: {np.mean(ensemble_metrics['test_loss']):.4f}, Acc: {np.mean(ensemble_metrics['test_acc']):.4f}, Radial: {np.mean(ensemble_metrics['test_radial']):.4f}")
+
+    Euclidean_matrix(model, X_train, seq_train, save_dir=save_dir, latent_hidden_list=latent_hidden_list)
 
 
+# -------------------------------------------------------
+#                    Connectivity 
+# -------------------------------------------------------
+
+def _get_latent_hidden_and_weight(model, X):
+    with torch.no_grad():
+        _, enc_lat = model.encoder(X)
+        hidden, _ = model.latent(enc_lat)
+        recurrent_layer = model.latent.h2h
+
+    hidden_np = hidden.detach().cpu().numpy().astype(np.float64)
+    w = recurrent_layer.weight.detach().cpu().numpy().astype(np.float64)
+    return hidden_np, w
+
+
+def plot_activity_along_modes(model, X, save_dir=SAVE_DIR, top_k=4):
+    os.makedirs(save_dir, exist_ok=True)
+
+    hidden_np, w = _get_latent_hidden_and_weight(model, X)
+    _, _, vt = np.linalg.svd(w, full_matrices=False)
+    k = max(1, min(top_k, vt.shape[0], hidden_np.shape[2]))
+    modes = vt[:k].T
+
+    proj = np.tensordot(hidden_np, modes, axes=([2], [0]))
+    proj_mean = proj.mean(axis=1)
+    proj_std = proj.std(axis=1)
+
+    plt.figure(figsize=(4, 3))
+    x = np.arange(1, proj_mean.shape[0] + 1)
+    for i in range(k):
+        line = plt.plot(x, proj_mean[:, i], marker='o', markersize=3, linewidth=1.4, label=f'mode {i + 1}')
+        color = line[0].get_color()
+        lower = proj_mean[:, i] - proj_std[:, i]
+        upper = proj_mean[:, i] + proj_std[:, i]
+        plt.fill_between(x, lower, upper, color=color, alpha=0.2, linewidth=0)
+    plt.xlabel('Timestep')
+    plt.ylabel('Projected activity')
+    plt.title(f'Latent Activity Along Top-{k} Modes')
+    plt.xticks(x)
+    plt.xlim(1, proj_mean.shape[0])
+    plt.grid(True, alpha=0.3)
+    plt.legend(fontsize=8, ncol=2)
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, 'latent_activity_along_modes.svg'), dpi=200)
+    plt.close()
+
+
+def plot_ultrametric_content(model, X, save_dir=SAVE_DIR, num_sv_list=(1, 2, 4, 6)):
+    os.makedirs(save_dir, exist_ok=True)
+
+    hidden_np, w = _get_latent_hidden_and_weight(model, X)
+    _, _, vt = np.linalg.svd(w, full_matrices=False)
+    max_k = min(vt.shape[0], hidden_np.shape[2])
+    t_steps = hidden_np.shape[0]
+    x = np.arange(1, t_steps + 1)
+
+    plt.figure(figsize=(4, 3))
+    for n_sv in num_sv_list:
+        if n_sv > max_k:
+            continue
+        modes = vt[:n_sv].T
+        proj = np.tensordot(hidden_np, modes, axes=([2], [0]))
+        uc_values = []
+        for t in range(t_steps):
+            dist_t = compute_distance(proj[None, t, :, :])[0]
+            uc_t = compute_umcontent(dist_t[None, :, :], return_triplets=False)[0]
+            uc_values.append(uc_t)
+        plt.plot(x, uc_values, marker='o', markersize=3, linewidth=1.4, label=f'numSV={n_sv}')
+
+    plt.xlabel('Timestep')
+    plt.ylabel('Ultrametric content')
+    plt.xticks(x)
+    plt.xlim(1, t_steps)
+    plt.grid(True, alpha=0.3)
+    plt.legend(fontsize=8)
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, 'ultrametric_content.svg'), dpi=200)
+    plt.close()
+
+    
 def train(model, X_train, X_test, test_labels, train_labels=None, types=None,
-    n_epochs=300, lr=0.001, weight_decay=1e-3, verbose=True):
+    n_epochs=300, lr=0.001, weight_decay=1e-3):
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
 
     history = {k: [] for k in ['train_loss', 'test_loss', 'train_acc', 'test_acc', 'train_radial', 'test_radial',
@@ -352,7 +553,7 @@ def train(model, X_train, X_test, test_labels, train_labels=None, types=None,
             history['test_A'].append(test_A)
         
         # Print at the final epoch if verbose
-        if verbose and epoch == n_epochs - 1:
+        if TRAIN_PRINT_FINAL and epoch == n_epochs - 1:
             print(f"\nEpoch {epoch+1}/{n_epochs}:")
             print(f"  Train - Loss: {total_loss.item():.4f}, Acc: {train_acc:.4f}, Radial: {train_radial:.4f} (P={train_P:.4f}, L={train_L:.4f}, A={train_A:.4f})")
             print(f"  Test  - Loss: {test_loss.item():.4f}, Acc: {test_acc:.4f}, Radial: {test_radial:.4f} (P={test_P:.4f}, L={test_L:.4f}, A={test_A:.4f})")
@@ -396,6 +597,16 @@ def run_experiment():
     history = train(model, X_train, X_test, test_labels, train_labels=train_labels, types=types,
         n_epochs=epochs, lr=lr, weight_decay=weight_decay)
 
+    # plotting
+    singular_value_curve(model, save_dir=SAVE_DIR)
+    hidden_dimensionality(model, X_test, save_dir=SAVE_DIR)
+    plot_euclidean_matrix(model, X_train, seq_train, X_test, test_labels, train_labels, types,
+        save_dir=SAVE_DIR, ensemble_seeds=range(40, 50))
+    trajectory_pca_latent(model, X_train, seq_train, save_dir=SAVE_DIR)
+    plot_activity_along_modes(model, X_train, save_dir=SAVE_DIR, top_k=4)
+    plot_ultrametric_content(model, X_train, save_dir=SAVE_DIR, num_sv_list=(1, 2, 4, 6))
+    
+    
     # final evaluation
     model.eval()
     with torch.no_grad():
@@ -410,8 +621,6 @@ def run_experiment():
 
     # compute numeric metrics (silhouette) and print
     compute_metrics(train_metrics, test_metrics, z_test, labels_test, types)
-    plot_diagnostics(model, X_train, torch.tensor(labels_train, dtype=torch.long), X_test, test_labels, types, save_dir=SAVE_DIR, history=history, seq_train=seq_train, seq_test=seq_test)
-
 
 if __name__ == '__main__':
     run_experiment()
