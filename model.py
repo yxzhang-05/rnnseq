@@ -506,7 +506,7 @@ class RNNDecoder(nn.Module):
 
 class RNNAutoencoder(nn.Module):
     def __init__(self, d_input, d_hidden, d_latent_hidden, num_layers, d_latent, sequence_length,
-            nonlinearity='relu',
+            nonlinearity='linear',
             device="cpu",
             model_filename=None, # file with model parameters
             to_freeze = [], # parameters to keep frozen; list with elements in ['i2h', 'h2h', 'h2o']
@@ -525,7 +525,7 @@ class RNNAutoencoder(nn.Module):
 
         self.encoder = RNNEncoder(d_input, d_hidden, num_layers, d_latent, nonlinearity, device,
             model_filename, from_file, to_freeze, init_weights, layer_type)
-        self.latent = RNN(d_latent, d_latent_hidden, num_layers, d_latent, layer_type=nn.Linear)
+        self.latent = RNN(d_latent, d_latent_hidden, num_layers, d_latent, nonlinearity, layer_type=nn.Linear)
 
         # Decoder takes d_latent (8-dim) as input from encoder's h2o output
         self.decoder = RNNDecoder(d_latent, d_hidden, num_layers, d_input, nonlinearity, device,

@@ -212,17 +212,39 @@ def compute_umcontent(M, return_triplets=True):
     - uc
     '''
 
-    D_combos = np.stack([[sorted([D[i,j], D[j,k], D[i,k]]) for i, j, k in combinations(range(D.shape[0]), 3)] for D in M])
+    D_combos = np.stack([
+        [sorted([D[i, j], D[j, k], D[i, k]]) for i, j, k in combinations(range(D.shape[0]), 3)]
+        for D in M
+    ]).astype(np.float64)
     # D_combos = np.stack([np.sort(np.array([[D[i,j], D[j,k], D[i,k]] for i, j, k in combinations(range(D.shape[0]), 3)]), axis=1) for D in M])
 
     if return_triplets:
         return D_combos
 
     # D_combos (time, triplets, 3)
-    _log_min_max = np.log( D_combos[:,:,0] / D_combos[:,:,2] )
-    _log_med_max = np.log( D_combos[:,:,1] / D_combos[:,:,2] )
-    lamda_combos = (_log_min_max - _log_med_max) / (_log_min_max + _log_med_max)
-    return np.nanmean(lamda_combos, axis=1)
+    d_min = D_combos[:, :, 0]
+    d_med = D_combos[:, :, 1]
+    d_max = D_combos[:, :, 2]
+
+    # Degenerate triplets can occur when some representations are identical,
+    # producing d_max = 0 or exact ratio 1. Clip ratios and treat 0/0 cases as 0.
+    eps = 1e-12
+    d_max_safe = np.maximum(d_max, eps)
+    ratio_min_max = np.clip(d_min / d_max_safe, eps, 1.0)
+    ratio_med_max = np.clip(d_med / d_max_safe, eps, 1.0)
+
+    with np.errstate(divide='ignore', invalid='ignore'):
+        _log_min_max = np.log(ratio_min_max)
+        _log_med_max = np.log(ratio_med_max)
+
+    denom = _log_min_max + _log_med_max
+    lamda_combos = np.divide(
+        _log_min_max - _log_med_max,
+        denom,
+        out=np.zeros_like(denom),
+        where=np.abs(denom) > eps,
+    )
+    return np.mean(lamda_combos, axis=1)
 
 
 def compute_overlap_AE(M, tokens, types):
