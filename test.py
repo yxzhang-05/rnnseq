@@ -8,18 +8,20 @@ from sequences import findStructures, replace_symbols as seq_replace_symbols
 import string
 import itertools
 from sklearn.decomposition import PCA
+from sklearn.metrics import confusion_matrix
+import copy
 import matplotlib.pyplot as plt
 import os
-from analysis_utils import radial_pattern_score, compute_umcontent, compute_distance
+from analysis_utils import compute_distance
 
 
-seed = 45
+seed = 11
 L, m, alpha = 4, 2, 6
 epochs = 1000 
 lr = 1e-3
-d_hidden = 12
-d_latent = 3
-d_latent_hidden = 6
+d_hidden = 4
+d_latent = 2
+d_latent_hidden = 2
 weight_decay = 1e-3 
 num_layers = 1
 device = torch.device('cpu')
@@ -87,7 +89,7 @@ def trajectory_pca_latent(model, X_train, seq_train, save_dir=SAVE_DIR):
     os.makedirs(save_dir, exist_ok=True)
 
     with torch.no_grad():
-        _, enc_lat = model.encoder(X_train)
+        enc_hidden, enc_lat = model.encoder(X_train)
         lat_hidden, _ = model.latent(enc_lat)
 
     # lat_hidden: [T, B, H] -> [(T*B), H]
@@ -108,34 +110,23 @@ def trajectory_pca_latent(model, X_train, seq_train, save_dir=SAVE_DIR):
         seq_chars = seq_chars[:, :t_plot]
 
     letters = np.unique(seq_chars)
-    muted_palette = ['#6c8ebf', '#5b8e7d', '#b07aa1', '#9e9d57', '#6fa3a3', '#c97c5d']
+    muted_palette = ['#5b8e7d', '#c97c5d', '#6c8ebf',  '#b07aa1', '#9e9d57', '#6fa3a3', ]
     # User-requested remap for first six letters: abcdef -> efacdb.
-    remap_order = [4, 5, 0, 2, 3, 1]
+    remap_order = [0, 1, 2, 3, 4, 5]
     remapped_palette = [muted_palette[i] for i in remap_order] + muted_palette
     color_map = {letter: remapped_palette[i % len(remapped_palette)] for i, letter in enumerate(letters)}
 
     plt.figure(figsize=(3, 3.5))
-    for b in range(batch_size):
-        xy = hidden_2d[:, b, :]
-        if t_steps <= 1:
-            plt.plot(xy[:, 0], xy[:, 1], color='0.6', linewidth=1.0, alpha=0.6, zorder=1)
-            continue
-        for t in range(t_steps - 1):
-            frac = t / max(t_steps - 2, 1)
-            gray = 0.88 - 0.58 * frac
-            plt.plot(xy[t:t + 2, 0], xy[t:t + 2, 1], color=(gray, gray, gray),
-                linewidth=1.0, alpha=1.0, zorder=1)
 
     for t in range(t_steps):
         letters_t = seq_chars[:, t]
         point_colors = [color_map[ch] for ch in letters_t]
         frac = t / max(t_steps - 1, 1)
-        tone = 0.90 - 0.55 * frac
-        edge_color = (tone, tone, tone)
+        alpha_t = 0.1 + 0.9 * frac 
         plt.scatter(
             hidden_2d[t, :, 0], hidden_2d[t, :, 1],
-            c=point_colors, s=34, marker='o', alpha=1.0,
-            edgecolors=edge_color, linewidths=0.35, zorder=3,
+            c=point_colors, s=30, marker='o', alpha=alpha_t,
+            edgecolors='none', linewidths=0, zorder=3,
         )
 
     legend_handles = [
@@ -145,8 +136,9 @@ def trajectory_pca_latent(model, X_train, seq_train, save_dir=SAVE_DIR):
     plt.xlabel(f'PC1 ({pca.explained_variance_ratio_[0] * 100:.1f}%)')
     plt.ylabel(f'PC2 ({pca.explained_variance_ratio_[1] * 100:.1f}%)')
     plt.grid(True, alpha=0.3)
-    plt.legend(handles=legend_handles, fontsize=8, ncol=3,
-               loc='upper center', bbox_to_anchor=(0.5, 1.22), frameon=False)
+    plt.legend(handles=legend_handles, fontsize=8, ncol=1,
+               loc='upper center', bbox_to_anchor=(0.5, 1.22),
+               frameon=True, framealpha=0.9, facecolor='#F7F7F7', edgecolor='0.8')
     plt.tight_layout(rect=[0, 0, 1, 0.9])
     plt.savefig(os.path.join(save_dir, 'latent_trajectory_pca_train.svg'), dpi=200)
     plt.close()
@@ -155,55 +147,103 @@ def trajectory_pca_latent(model, X_train, seq_train, save_dir=SAVE_DIR):
 def pca_latent_residual(model, X_train, seq_train, save_dir=SAVE_DIR):
     os.makedirs(save_dir, exist_ok=True)
 
+    # ===== get latent states =====
     with torch.no_grad():
-        _, enc_lat = model.encoder(X_train)
+        enc_hidden, enc_lat = model.encoder(X_train)
         lat_hidden, _ = model.latent(enc_lat)
 
-    hidden_np = lat_hidden.detach().cpu().numpy()  # [T, B, H]
-    t_steps, batch_size, hidden_dim = hidden_np.shape
+    h = lat_hidden.cpu().numpy()  # [T, B, H]
+    T, B, H = h.shape
 
     seq_chars = np.asarray([list(s) for s in np.asarray(seq_train)])  # [B, T]
-    t_plot = min(seq_chars.shape[1], t_steps)
-    hidden_np = hidden_np[:t_plot]
-    seq_chars = seq_chars[:, :t_plot]
+    T = min(T, seq_chars.shape[1])
+    h, seq_chars = h[:T], seq_chars[:, :T]
 
-    # Subtract per-token mean: E[h | token=c], pooled across all timesteps.
-    hidden_residual = hidden_np.copy()
-    unique_tokens = np.unique(seq_chars)
-    for token in unique_tokens:
-        token_mask = (seq_chars == token).T  # [T, B], align with hidden_np axes.
-        if not np.any(token_mask):
-            continue
-        mu = hidden_np[token_mask].mean(axis=0)
-        hidden_residual[token_mask] = hidden_np[token_mask] - mu
+    # ===== residual 1: remove token mean =====
+    h_token_res = h.copy()
+    for tok in np.unique(seq_chars):
+        mask = (seq_chars == tok).T
+        if mask.any():
+            mu = h[mask].mean(0)
+            h_token_res[mask] -= mu
 
-    hidden_flat = hidden_residual.reshape(t_plot * batch_size, hidden_dim)
+    # ===== residual 2: remove timestep drift =====
+    drift = h.mean(axis=1, keepdims=True)
+    h_minus_drift = h - drift
+
+    # ===== PCA (fit once on original representation) =====
     pca = PCA(n_components=2)
-    hidden_2d_flat = pca.fit_transform(hidden_flat)
-    hidden_2d = hidden_2d_flat.reshape(t_plot, batch_size, 2)
+    pca.fit(h.reshape(T * B, H))
 
-    # Use a light-to-dark blue gradient across timesteps.
-    cmap = plt.get_cmap('Blues')
+    def project(x):
+        z = pca.transform(x.reshape(T * B, H))
+        return z.reshape(T, B, 2)
 
-    fig, ax = plt.subplots(figsize=(PLOT_SIZE, PLOT_SIZE))
-    for t in range(t_plot):
-        frac = t / max(t_plot - 1, 1)
-        point_color = cmap(0.2 + 0.6 * frac)
-        alpha_t = 0.2 + 0.7 * (frac ** 1.8)
-        ax.scatter(
-            hidden_2d[t, :, 0], hidden_2d[t, :, 1],
-            color=point_color, s=22, alpha=alpha_t,
-            linewidths=0.0,
-        )
+    z_token_res = project(h_token_res)
+    z_minus_drift = project(h_minus_drift)
 
-    ax.set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0] * 100:.1f}%)')
-    ax.set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1] * 100:.1f}%)')
-    ax.grid(True, alpha=0.25)
-    ax.set_aspect('equal', adjustable='box')
-    ax.set_box_aspect(1)
-    fig.tight_layout()
-    fig.savefig(os.path.join(save_dir, 'latent_pca_residual.svg'), dpi=200)
-    plt.close(fig)
+    # ===== plot 1: time gradient =====
+    def plot_time(z, name):
+        cmap = plt.get_cmap("Blues")
+        fig, ax = plt.subplots(figsize=(PLOT_SIZE, PLOT_SIZE))
+
+        for t in range(T):
+            frac = t / max(T - 1, 1)
+            ax.scatter(
+                z[t, :, 0], z[t, :, 1],
+                color=cmap(0.2 + 0.6 * frac),
+                alpha=0.25 + 0.7 * (frac ** 1.8),
+                s=22, linewidths=0
+            )
+
+        ax.set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]*100:.1f}%)')
+        ax.set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]*100:.1f}%)')
+        ax.grid(True, alpha=0.25)
+        ax.set_aspect('equal')
+        ax.set_box_aspect(1)
+        fig.tight_layout()
+        fig.savefig(os.path.join(save_dir, name), dpi=200)
+        plt.close(fig)
+        
+
+    # ===== plot 2: token + timestep =====
+    def plot_token_time(z, name):
+        colors = ['#5b8e7d','#c97c5d','#6c8ebf','#b07aa1','#9e9d57','#6fa3a3']
+        tokens = np.sort(np.unique(seq_chars))
+        tok_color = {t: colors[i % len(colors)] for i, t in enumerate(tokens)}
+
+        fig, ax = plt.subplots(figsize=(3, 3))
+
+        for t in range(T):
+            frac = t / max(T - 1, 1)
+            alpha = 0.25 + 0.65 * (frac ** 1.5)
+            for tok in tokens:
+                mask = seq_chars[:, t] == tok
+                if mask.any():
+                    ax.scatter(
+                        z[t, mask, 0], z[t, mask, 1],
+                        color=tok_color[tok],
+                        alpha=alpha,
+                        s=22, linewidths=0
+                    )
+
+        # add legend for tokens
+        legend_handles = [plt.Line2D([0], [0], color=tok_color[t], marker='o', lw=0, markersize=5, label=str(t)) for t in tokens]
+        # arrange token legend in 2 x 3 layout (3 columns)
+        ax.legend(handles=legend_handles, title='Token', fontsize=8, loc='upper center', bbox_to_anchor=(0.5, 1.12), ncol=3, frameon=False)
+
+        ax.set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]*100:.1f}%)')
+        ax.set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]*100:.1f}%)')
+        ax.grid(True, alpha=0.25)
+        ax.set_aspect('equal')
+        ax.set_box_aspect(1)
+        fig.tight_layout()
+        fig.savefig(os.path.join(save_dir, name), dpi=200)
+        plt.close(fig)
+
+    plot_time(z_token_res, 'latent_token_residual.svg')
+    plot_token_time(z_minus_drift, 'latent_minus_drift.svg')
+
 
 
 def train_linear_decoders(model, X_train, seq_train, X_test, seq_test, save_dir=SAVE_DIR,
@@ -466,49 +506,71 @@ def Euclidean_matrix(model, X_train, seq_train, save_dir=SAVE_DIR, latent_hidden
                    
 # Singular Value Curves
 def singular_value_curve(model=None, save_dir=SAVE_DIR, block_weight_list=None,
-    low_pct=5, high_pct=95):
-    os.makedirs(save_dir, exist_ok=True)
-
+    low_pct=5, high_pct=95, matrices=None, block_order=None, titles=None, out_name=None):
     def _orthogonal_similarity_align(weight_list):
+
         if len(weight_list) == 0:
             return []
 
-        u_ref, _, _ = np.linalg.svd(weight_list[0], full_matrices=True)
+        # Reference SVD (use full matrices to get square U and V bases)
+        w0 = weight_list[0]
+        if w0.ndim != 2:
+            raise ValueError('Each weight matrix must be 2D for similarity alignment.')
+        U_ref, _, Vh_ref = np.linalg.svd(w0, full_matrices=True)
+        V_ref = Vh_ref.T
+
         aligned = []
         for w in weight_list:
             if w.ndim != 2:
                 raise ValueError('Each weight matrix must be 2D for similarity alignment.')
-            u_cur, _, _ = np.linalg.svd(w, full_matrices=True)
-            q = u_ref @ u_cur.T
-            aligned.append(q @ w @ q.T)
+            U_cur, _, Vh_cur = np.linalg.svd(w, full_matrices=True)
+            V_cur = Vh_cur.T
+            # q_left: aligns left singular vectors (rows), q_right: aligns right singular vectors (cols)
+            q_left = U_ref @ U_cur.T
+            q_right = V_ref @ V_cur.T
+            aligned.append(q_left @ w @ q_right.T)
         return aligned
 
+    # If caller provided a block_weight_list (from ensemble), use it directly.
     if block_weight_list is None or len(block_weight_list) == 0:
-        if model is None:
-            raise ValueError('Either model or block_weight_list must be provided.')
-        block_weight_list = [{
-            'encoder': model.encoder.rnn.h2h.weight.detach().cpu().numpy().astype(np.float64),
-            'latent': model.latent.h2h.weight.detach().cpu().numpy().astype(np.float64),
-            'decoder': model.decoder.rnn.h2h.weight.detach().cpu().numpy().astype(np.float64),
-        }]
+        block_weight_list = []
+        # We convert matrices[name] into a list of weight arrays per seed
+        max_seeds = 0
+        for name in block_order:
+            val = matrices[name]
+            if isinstance(val, (list, tuple)):
+                n = len(val)
+            else:
+                n = 1
+            max_seeds = max(max_seeds, n)
 
-    block_order = ['latent']
-    titles = {
-        'latent': 'latent',
-    }
+        for seed_idx in range(max_seeds):
+            bw = {}
+            for name in block_order:
+                val = matrices[name]
+                if isinstance(val, (list, tuple)):
+                    arr = val[seed_idx] if seed_idx < len(val) else val[0]
+                else:
+                    arr = val
+                bw[name] = np.asarray(arr, dtype=np.float64)
+            block_weight_list.append(bw)
+
     legend_handles = [
         plt.Line2D([0], [0], color='#2E5CB8', linestyle='--', linewidth=3.2,
-            label=r'$\langle SV(W_{h}) \rangle_k$'),
+            label=r'$\langle SV(W) \rangle_k$'),
         plt.Line2D([0], [0], color='#2E5CB8', linestyle=':', linewidth=3.2,
-            label=r'$SV\langle W_h^{(k)} \rangle_k$'),
+            label=r'$SV\langle W \rangle_k$'),
         plt.Line2D([0], [0], color='#C23B3B', linestyle='-', linewidth=3.2,
             marker='o', markersize=4,
-            label=r'$SV\langle \overline{W}_h^{(k)} \rangle_k$'),
+            label=r'$SV\langle W_{aligned} \rangle_k$'),
     ]
 
-    fig, axes = plt.subplots(1, 1, figsize=(PLOT_SIZE, PLOT_SIZE), sharey=False)
+    block_order = list(block_weight_list[0].keys())
+    n_blocks = len(block_order)
+    fig, axes = plt.subplots(1, n_blocks, figsize=(PLOT_SIZE * n_blocks, PLOT_SIZE), sharey=False)
     axes = np.atleast_1d(axes)
     plt.rcParams['font.size'] = PLOT_FONT
+
     for ax, block_name in zip(axes, block_order):
         w_list = [bw[block_name] for bw in block_weight_list]
         sv_stack = np.asarray([np.linalg.svd(w, compute_uv=False) for w in w_list], dtype=np.float64)
@@ -540,7 +602,7 @@ def singular_value_curve(model=None, save_dir=SAVE_DIR, block_weight_list=None,
         if max_index >= 2:
             ax.axvspan(0.0, 2.0, color='#D94848', alpha=0.10)
 
-        ax.set_title(titles[block_name], fontsize=PLOT_FONT, fontweight='bold')
+        ax.set_title(titles.get(block_name, block_name), fontsize=PLOT_FONT, fontweight='bold')
         ax.set_xlabel('index', fontsize=PLOT_FONT)
         ax.set_xlim(0, max_index)
         desired_ticks = [t for t in (2, 5, 10) if t <= max_index]
@@ -554,7 +616,8 @@ def singular_value_curve(model=None, save_dir=SAVE_DIR, block_weight_list=None,
     axes[-1].legend(handles=legend_handles, fontsize=PLOT_FONT, loc='upper right',
         frameon=True, framealpha=0.9, facecolor='#F7F7F7', edgecolor='0.8')
     fig.tight_layout()
-    fig.savefig(os.path.join(save_dir, 'singular_value_curves.svg'), dpi=200)
+    filename = 'singular_value_curves.svg' if out_name is None else f"{out_name}.svg"
+    fig.savefig(os.path.join(save_dir, filename), dpi=200)
     plt.close(fig)
 
 
@@ -682,13 +745,232 @@ def _get_block_hidden_and_weight(model, X):
     }
 
 
-    
+
+def confusion_matrices(pred, target, n_classes=None, labels=None,save_path=None, vmax=None, cmap='cividis'):
+
+    # convert to numpy (ensure ints)
+    if hasattr(pred, 'cpu'):
+        pred_np = pred.detach().cpu().numpy()
+    else:
+        pred_np = np.array(pred)
+    if hasattr(target, 'cpu'):
+        target_np = target.detach().cpu().numpy()
+    else:
+        target_np = np.array(target)
+
+    pred_np = pred_np.astype(int)
+    target_np = target_np.astype(int)
+
+    # flatten over time and batch to aggregate counts
+    if pred_np.ndim == 1:
+        y_pred_all = pred_np
+        y_true_all = target_np
+    else:
+        y_pred_all = pred_np.reshape(-1)
+        y_true_all = target_np.reshape(-1)
+
+    labels = list(labels) if labels is not None else list(range(n_classes))
+
+    counts = np.zeros((n_classes, n_classes), dtype=int)
+    for yt, yp in zip(y_true_all, y_pred_all):
+        counts[int(yt), int(yp)] += 1
+
+    # Convert to proportions per true class (row-normalized) in [0,1]
+    counts_f = counts.astype(float)
+    row_sums = counts_f.sum(axis=1, keepdims=True)
+    # avoid div-by-zero
+    row_sums[row_sums == 0] = 1.0
+    props = counts_f / row_sums
+
+    # prepare plot
+    if save_path is None:
+        save_path = os.path.join(SAVE_DIR, 'confusion_matrix.svg')
+
+    fig, ax = plt.subplots(figsize=(3.2, 3))
+    im = ax.imshow(props, interpolation='nearest', cmap=cmap, aspect='equal', vmin=0.0, vmax=1.0)
+
+    Cdim = props.shape[0]
+    for r in range(Cdim):
+        for c in range(Cdim):
+            val = props[r, c]
+            txt = f'{val:.2f}' if val > 0 else ''
+            color = 'white' if val < 0.7 else 'gray'
+            ax.text(c, r, txt, ha='center', va='center', color=color, fontsize=8)
+
+    ax.set_xticks(range(len(labels)))
+    ax.set_xticklabels(labels, rotation=0, fontsize=PLOT_FONT)
+    ax.set_yticks(range(len(labels)))
+    ax.set_yticklabels(labels, fontsize=PLOT_FONT)
+    ax.set_xlabel('Reconstructed', fontsize=PLOT_FONT)
+    ax.set_ylabel('True', fontsize=PLOT_FONT)
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=200)
+    plt.close(fig)
+
+
+
+def whh_ablation(model, X_train, X_test, test_labels, train_labels=None, types=None, n_epochs=None):
+
+    # create fresh model to train under ablated condition
+    pert = model(alpha, d_hidden, d_latent_hidden, num_layers, d_latent, L).to(device)
+
+    def _zero_and_freeze_whh(m):
+        # zero full-rank weight if present
+        with torch.no_grad():
+            if hasattr(m, 'weight') and isinstance(getattr(m, 'weight'), torch.Tensor):
+                try:
+                    m.weight.data.zero_()
+                except Exception:
+                    pass
+            if hasattr(m, 'U') and getattr(m, 'U') is not None:
+                try:
+                    m.U.data.zero_()
+                except Exception:
+                    pass
+            if hasattr(m, 'V') and getattr(m, 'V') is not None:
+                try:
+                    m.V.data.zero_()
+                except Exception:
+                    pass
+        # freeze parameters so they remain zero during training
+        for p in m.parameters():
+            p.requires_grad = False
+
+    # zero & freeze encoder, latent, decoder Whh if available
+    try:
+        _zero_and_freeze_whh(pert.encoder.rnn.h2h)
+    except Exception:
+        pass
+    try:
+        _zero_and_freeze_whh(pert.latent.h2h)
+    except Exception:
+        pass
+    try:
+        _zero_and_freeze_whh(pert.decoder.rnn.h2h)
+    except Exception:
+        pass
+
+    # train perturbed model normally (Whh stay zero because frozen)
+    train(pert, X_train, X_test, test_labels, train_labels=train_labels, types=types,
+          n_epochs=n_epochs, lr=lr, weight_decay=weight_decay, print_final=False)
+
+    # evaluate
+    pert.eval()
+    with torch.no_grad():
+        _, _, output = pert(X_test)
+    pred = torch.argmax(output, dim=-1)
+    target = torch.argmax(X_test, dim=-1)
+    acc = (pred == target).all(dim=0).float().mean().item()
+    confusion_matrices(pred, target, n_classes=alpha,
+            labels=list(string.ascii_lowercase[:alpha]))
+    print(f'[4] W_hh ablation (trained with W_hh=0): acc={acc:.4f}')
+    return acc
+
+
+def heatmap_whh(seeds, save_dir=SAVE_DIR):
+    results = np.zeros((len(seeds), 3), dtype=float)
+
+    for i, s in enumerate(seeds):
+        print(f"Running seed {s} ({i+1}/{len(seeds)})")
+        set_seed(s)
+
+        # generate data deterministically for this seed
+        seq_train, seq_test, labels_train, labels_test, types = generate_instances(alpha, L, m, frac_train=0.8)
+        X_train = sequences_to_tensor(seq_train, alpha).to(device)
+        X_test = sequences_to_tensor(seq_test, alpha).to(device)
+        test_labels = torch.tensor(labels_test, dtype=torch.long)
+        train_labels = torch.tensor(labels_train, dtype=torch.long)
+
+        # create and train model
+        model = RNNAutoencoder(alpha, d_hidden, d_latent_hidden, num_layers, d_latent, L).to(device)
+        train(model, X_train, X_test, test_labels, train_labels=train_labels, types=types,
+                        n_epochs=1000, lr=lr, weight_decay=weight_decay, print_final=False)
+
+        # compute accuracies for several conditions via loop
+        conditions = [
+            ('normal', []),
+            ('all', ['encoder', 'latent', 'decoder']),
+            ('trained_whh_zero', None),
+        ]
+
+        # compute target once
+        with torch.no_grad():
+            target = torch.argmax(X_test, dim=-1)
+
+        for j, (name, zero_parts) in enumerate(conditions):
+            if name == 'trained_whh_zero':
+                acc = whh_ablation(model, X_train, X_test, test_labels, train_labels=train_labels, types=types, n_epochs=1000)
+                results[i, j] = acc
+                continue
+            if len(zero_parts) == 0:
+                with torch.no_grad():
+                    _, _, out = model(X_test)
+            else:
+                with torch.no_grad():
+                    pert = copy.deepcopy(model)
+                    if 'encoder' in zero_parts:
+                        pert.encoder.rnn.h2h.weight.data.zero_()
+                    if 'latent' in zero_parts:
+                        pert.latent.h2h.weight.data.zero_()
+                    if 'decoder' in zero_parts:
+                        pert.decoder.rnn.h2h.weight.data.zero_()
+                    _, _, out = pert(X_test)
+
+            pred = torch.argmax(out, dim=-1)
+            acc = (pred == target).all(dim=0).float().mean().item()
+            results[i, j] = acc
+
+    # sort rows by normal accuracy (column 0) descending, then plot heatmap
+    order = np.argsort(results[:, 0])[::-1]
+    results_sorted = results[order, :]
+
+    fig, ax = plt.subplots(figsize=(3, 3.5))
+    im = ax.imshow(results_sorted, cmap='cividis', aspect='auto', vmin=0.0, vmax=1.0)
+    # x ticks: three conditions (baseline, all-zero, retrained Whh=0)
+    ax.set_xticks(np.arange(3))
+    ax.set_xticklabels(['normal', 'all', 'trained'], rotation=45, ha='right')
+    ax.set_ylabel('Simulation')
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    plot_path = os.path.join(save_dir, 'whh_seeds_heatmap.svg')
+    fig.tight_layout()
+    fig.savefig(plot_path, dpi=200)
+    plt.close(fig)
+    print(f"Saved heatmap to {plot_path}")
+    return results_sorted
+
+
+def Whh_test(model, X_train, X_test, seq_train, seq_test, save_dir=SAVE_DIR):
+
+    pert = copy.deepcopy(model)
+    pert.encoder.rnn.h2h.weight.data.zero_()
+    pert.latent.h2h.weight.data.zero_()
+    pert.decoder.rnn.h2h.weight.data.zero_()
+
+    with torch.no_grad():
+        _, _, test_output_pert = pert(X_test)
+        pred_test = torch.argmax(test_output_pert, dim=-1)
+        target_test = torch.argmax(X_test, dim=-1)
+    acc = (pred_test == target_test).all(dim=0).float().mean().item()
+    confusion_matrices(pred_test, target_test, n_classes=alpha, labels=list(string.ascii_lowercase[:alpha]))
+
+    # Use test data for downstream analyses when evaluating test-time W=0
+    trajectory_pca_latent(pert, X_test, seq_test, save_dir)
+    bwp = _get_block_hidden_and_weight(pert, X_test)
+    # singular_value_curve(save_dir,
+    #                      matrices={'W_enc': bwp['encoder']['weight'], 'W_lat': bwp['latent']['weight'], 'W_dec': bwp['decoder']['weight']},
+    #                      block_order=['W_enc', 'W_lat', 'W_dec'],
+    #                      titles={'W_enc': r'Encoder $W_{hh}$', 'W_lat': r'Latent $W_{hh}$', 'W_dec': r'Decoder $W_{hh}$'},
+    #                      out_name='singular_values')
+
+    print(f'[Whh_test] accuracy: {acc:.4f}')
+
+
 def train(model, X_train, X_test, test_labels, train_labels=None, types=None,
     n_epochs=300, lr=0.001, weight_decay=1e-3, print_final=True):
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
 
-    history = {k: [] for k in ['train_loss', 'test_loss', 'train_acc', 'test_acc', 'train_radial', 'test_radial',
-                                'train_P', 'train_L', 'train_A', 'test_P', 'test_L', 'test_A']}
+    history = {k: [] for k in ['train_loss', 'test_loss', 'train_acc', 'test_acc']}
  
     for epoch in range(n_epochs):
         model.train()
@@ -713,7 +995,6 @@ def train(model, X_train, X_test, test_labels, train_labels=None, types=None,
             target_train = torch.argmax(X_batch, dim=-1)
             train_acc = (pred_train == target_train).all(dim=0).float().mean().item()
             
-            # Only compute radial score at the last epoch to save time
             if train_labels is not None and epoch == n_epochs - 1:
                 if latent.ndim == 3:
                     latent_2d = latent.permute(1, 0, 2).reshape(latent.shape[1], -1)
@@ -723,14 +1004,6 @@ def train(model, X_train, X_test, test_labels, train_labels=None, types=None,
                 latent_np = latent_2d.cpu().numpy()
                 labels_np = train_labels.cpu().numpy()
                 unique_labels = np.unique(labels_np)
-                if len(unique_labels) > 1 and types is not None:
-                    train_radial, train_P, train_L, train_A = radial_pattern_score(
-                        latent_np, labels_np, types, return_components=True)
-                else:
-                    train_radial, train_P, train_L, train_A = 0.0, 0.0, 0.0, 0.0
-            else:
-                # Use dummy value for non-final epochs
-                train_radial, train_P, train_L, train_A = 0.0, 0.0, 0.0, 0.0
 
         model.eval()
         with torch.no_grad():
@@ -745,46 +1018,19 @@ def train(model, X_train, X_test, test_labels, train_labels=None, types=None,
             target_test = torch.argmax(X_test, dim=-1)
             test_acc = (pred_test == target_test).all(dim=0).float().mean().item()
 
-            if test_latent.ndim == 3:
-                test_latent_2d = test_latent.permute(1, 0, 2).reshape(test_latent.shape[1], -1)
-            else:
-                test_latent_2d = test_latent
-            
-            # Only compute test radial score at the last epoch to save time
-            if epoch == n_epochs - 1:
-                test_latent_np = test_latent_2d.cpu().numpy()
-                test_labels_np = test_labels.cpu().numpy()
-                unique_labels = np.unique(test_labels_np)
-                if len(unique_labels) > 1 and types is not None:
-                    test_radial, test_P, test_L, test_A = radial_pattern_score(
-                        test_latent_np, test_labels_np, types, return_components=True)
-                else:
-                    test_radial, test_P, test_L, test_A = 0.0, 0.0, 0.0, 0.0
-            else:
-                # Use dummy value for non-final epochs
-                test_radial, test_P, test_L, test_A = 0.0, 0.0, 0.0, 0.0
-
         # history - only save final epoch values to reduce memory
         if epoch == n_epochs - 1:
             history['train_loss'].append(total_loss.item())
             history['test_loss'].append(float(test_loss))
             history['train_acc'].append(train_acc)
             history['test_acc'].append(test_acc)
-            history['train_radial'].append(float(train_radial))
-            history['test_radial'].append(float(test_radial))
-            history['train_P'].append(float(train_P))
-            history['train_L'].append(float(train_L))
-            history['train_A'].append(float(train_A))
-            history['test_P'].append(float(test_P))
-            history['test_L'].append(float(test_L))
-            history['test_A'].append(float(test_A))
 
         
         # Print at the final epoch when enabled.
         if print_final and epoch == n_epochs - 1:
             print(f"\nEpoch {epoch+1}/{n_epochs}:")
-            print(f"  Train - Loss: {total_loss.item():.4f}, Acc: {train_acc:.4f}, Radial: {train_radial:.4f} (P={train_P:.4f}, L={train_L:.4f}, A={train_A:.4f})")
-            print(f"  Test  - Loss: {test_loss.item():.4f}, Acc: {test_acc:.4f}, Radial: {test_radial:.4f} (P={test_P:.4f}, L={test_L:.4f}, A={test_A:.4f})")
+            print(f"  Train - Loss: {total_loss.item():.4f}, Acc: {train_acc:.4f}")
+            print(f"  Test  - Loss: {test_loss.item():.4f}, Acc: {test_acc:.4f}")
 
     return history
 
@@ -864,19 +1110,60 @@ def run_experiment():
     history = train(model, X_train, X_test, test_labels, train_labels=train_labels, types=types,
         n_epochs=epochs, lr=lr, weight_decay=weight_decay)
 
+    
+    # confusion matrices
+    with torch.no_grad():
+        _, _, train_output = model(X_train)
+        pred_train = torch.argmax(train_output, dim=-1)
+        target_train = torch.argmax(X_train, dim=-1)
+    confusion_matrices(pred_train, target_train, n_classes=alpha, labels=list(string.ascii_lowercase[:alpha]))
+    
     # plotting
     
     # ensemble_seeds = range(40, 50)
     # block_hidden_weight_list, block_weight_list, block_hidden_list, latent_hidden_train_list, latent_hidden_test_list = _build_ensemble_block_lists(
     #     ensemble_seeds, X_train, X_test, test_labels, train_labels, types)
 
-    # Euclidean_matrix(model, X_train, seq_train, save_dir=SAVE_DIR, latent_hidden_list=latent_hidden_train_list)
+    # # Euclidean_matrix(model, X_train, seq_train, save_dir=SAVE_DIR, latent_hidden_list=latent_hidden_train_list)
     # train_linear_decoders(model, X_train, seq_train, X_test, seq_test, save_dir=SAVE_DIR,
     #     n_epochs=400, lr=1e-2, latent_hidden_train_list=latent_hidden_train_list,
     #     latent_hidden_test_list=latent_hidden_test_list)
+
     # trajectory_pca_latent(model, X_train, seq_train, save_dir=SAVE_DIR)
     # pca_latent_residual(model, X_train, seq_train, save_dir=SAVE_DIR)
-    # singular_value_curve(save_dir=SAVE_DIR, block_weight_list=block_weight_list)
+    # pca_encoder_input(model, X_train, seq_train, save_dir=SAVE_DIR)
+
+    # Whh_test(model, X_train, X_test, seq_train, seq_test, save_dir=SAVE_DIR)
+
+    # # Whh_ablation
+    # seeds = list(range(seed, seed + 20))
+    # heatmap_whh(seeds, save_dir=SAVE_DIR)
+
+    # # encoder Win (i2h)
+    # W_in = model.encoder.rnn.i2h.weight.detach().cpu().numpy().astype(np.float64)
+    # singular_value_curve(matrices={'W_in': W_in}, block_order=['W_in'], titles={'W_in': r'Encoder $W_{in}$'}, save_dir=SAVE_DIR, out_name='singular_values_Win')
+    # Whh_enc = model.encoder.rnn.h2h.weight.detach().cpu().numpy().astype(np.float64)
+    # singular_value_curve(matrices={'Whh_enc': Whh_enc}, block_order=['Whh_enc'], titles={'Whh_enc': r'Encoder $W_{hh}$'}, save_dir=SAVE_DIR, out_name='singular_values_Whh_encoder')
+    # W_out_enc = model.encoder.rnn.h2o.weight.detach().cpu().numpy().astype(np.float64)
+    # singular_value_curve(matrices={'W_out_enc': W_out_enc}, block_order=['W_out_enc'], titles={'W_out_enc': r'Encoder $W_{out}$'}, save_dir=SAVE_DIR, out_name='singular_values_Wout_encoder')
+
+    # # latent Win and Wout
+    # W_in_lat = model.latent.i2h.weight.detach().cpu().numpy().astype(np.float64)
+    # singular_value_curve(matrices={'W_in_lat': W_in_lat}, block_order=['W_in_lat'], titles={'W_in_lat': r'Latent $W_{in}$'}, save_dir=SAVE_DIR, out_name='singular_values_Win_latent')
+    # Whh_lat = model.latent.h2h.weight.detach().cpu().numpy().astype(np.float64)
+    # singular_value_curve(matrices={'Whh_lat': Whh_lat}, block_order=['Whh_lat'], titles={'Whh_lat': r'Latent $W_{hh}$'}, save_dir=SAVE_DIR, out_name='singular_values_Whh_latent')
+    # W_out_lat = model.latent.h2o.weight.detach().cpu().numpy().astype(np.float64)
+    # singular_value_curve(matrices={'W_out_lat': W_out_lat}, block_order=['W_out_lat'], titles={'W_out_lat': r'Latent $W_{out}$'}, save_dir=SAVE_DIR, out_name='singular_values_Wout_latent')
+
+    # # decoder
+    # W_in_dec = model.decoder.rnn.i2h.weight.detach().cpu().numpy().astype(np.float64)
+    # singular_value_curve(matrices={'W_in_dec': W_in_dec}, block_order=['W_in_dec'], titles={'W_in_dec': r'Decoder $W_{in}$'}, save_dir=SAVE_DIR, out_name='singular_values_Win_decoder')
+    # Whh_dec = model.decoder.rnn.h2h.weight.detach().cpu().numpy().astype(np.float64)
+    # singular_value_curve(matrices={'Whh_dec': Whh_dec}, block_order=['Whh_dec'], titles={'Whh_dec': r'Decoder $W_{hh}$'}, save_dir=SAVE_DIR, out_name='singular_values_Whh_decoder') 
+    # W_out = model.decoder.rnn.h2o.weight.detach().cpu().numpy().astype(np.float64)
+    # singular_value_curve(matrices={'W_out': W_out}, block_order=['W_out'], titles={'W_out': r'Decoder $W_{out}$'}, save_dir=SAVE_DIR, out_name='singular_values_Wout')
+    
+    
     # hidden_participation_ratio(model, X_test, labels=labels_test, types=types,
     #     save_dir=SAVE_DIR, block_hidden_list=block_hidden_list)
     
@@ -889,11 +1176,11 @@ def run_experiment():
         target_test = torch.argmax(X_test, dim=-1)
         test_acc = (pred_test == target_test).all(dim=0).float().mean().item()
 
-    train_acc = history['train_acc'][-1] if len(history['train_acc']) > 0 else 0.0
-    train_metrics = {'acc': train_acc}
-    test_metrics = {'acc': test_acc}
+    # train_acc = history['train_acc'][-1] if len(history['train_acc']) > 0 else 0.0
+    # train_metrics = {'acc': train_acc}
+    # test_metrics = {'acc': test_acc}
 
-    compute_metrics(train_metrics, test_metrics, z_test, labels_test, types)
+    # compute_metrics(train_metrics, test_metrics, z_test, labels_test, types)
 
 if __name__ == '__main__':
     run_experiment()
