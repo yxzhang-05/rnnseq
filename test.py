@@ -3,7 +3,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import pandas as pd
-from model import RNNAutoencoder
+from model import RNNAutoencoder, RNN
 from sequences import findStructures, replace_symbols as seq_replace_symbols
 import string
 import itertools
@@ -15,13 +15,13 @@ import os
 from analysis_utils import compute_distance
 
 
-seed = 11
+seed = 7
 L, m, alpha = 4, 2, 6
 epochs = 1000 
 lr = 1e-3
-d_hidden = 4
+d_hidden = 32
 d_latent = 2
-d_latent_hidden = 2
+d_latent_hidden = 3
 weight_decay = 1e-3 
 num_layers = 1
 device = torch.device('cpu')
@@ -88,12 +88,19 @@ def sequences_to_tensor(sequences, alpha):
 def trajectory_pca_latent(model, X_train, seq_train, save_dir=SAVE_DIR):
     os.makedirs(save_dir, exist_ok=True)
 
-    with torch.no_grad():
-        enc_hidden, enc_lat = model.encoder(X_train)
-        lat_hidden, _ = model.latent(enc_lat)
+    def _get_lat_hidden(m):
+        with torch.no_grad():
+            if hasattr(m, 'encoder'):
+                enc_hidden, enc_lat = m.encoder(X_train)
+                lat_hidden, _ = m.latent(enc_lat)
+            else:
+                lat_hidden, _ = m(X_train)
+        return lat_hidden.detach().cpu().numpy()
 
-    # lat_hidden: [T, B, H] -> [(T*B), H]
-    hidden_np = lat_hidden.detach().cpu().numpy()
+    lat_hidden = _get_lat_hidden(model)
+
+    # lat_hidden: already a numpy array of shape [T, B, H]
+    hidden_np = lat_hidden
     t_steps, batch_size, hidden_dim = hidden_np.shape
     hidden_flat = hidden_np.reshape(t_steps * batch_size, hidden_dim)
 
@@ -118,6 +125,16 @@ def trajectory_pca_latent(model, X_train, seq_train, save_dir=SAVE_DIR):
 
     plt.figure(figsize=(3, 3.5))
 
+    # draw connecting gray lines for each sequence, with segment alpha increasing over time
+    ax = plt.gca()
+    for i in range(batch_size):
+        for t_seg in range(t_steps - 1):
+            x0, y0 = hidden_2d[t_seg, i, 0], hidden_2d[t_seg, i, 1]
+            x1, y1 = hidden_2d[t_seg + 1, i, 0], hidden_2d[t_seg + 1, i, 1]
+            # alpha increases with time (later segments more opaque)
+            alpha_seg = 0.05 + 0.3 * ((t_seg + 1) / max(t_steps - 1, 1))
+            ax.plot([x0, x1], [y0, y1], color='black', linewidth=0.9, alpha=alpha_seg, zorder=1)
+
     for t in range(t_steps):
         letters_t = seq_chars[:, t]
         point_colors = [color_map[ch] for ch in letters_t]
@@ -127,6 +144,7 @@ def trajectory_pca_latent(model, X_train, seq_train, save_dir=SAVE_DIR):
             hidden_2d[t, :, 0], hidden_2d[t, :, 1],
             c=point_colors, s=30, marker='o', alpha=alpha_t,
             edgecolors='none', linewidths=0, zorder=3,
+            label='model A' if t == 0 else None
         )
 
     legend_handles = [
@@ -148,11 +166,16 @@ def pca_latent_residual(model, X_train, seq_train, save_dir=SAVE_DIR):
     os.makedirs(save_dir, exist_ok=True)
 
     # ===== get latent states =====
-    with torch.no_grad():
-        enc_hidden, enc_lat = model.encoder(X_train)
-        lat_hidden, _ = model.latent(enc_lat)
+    def _get_h(m):
+        with torch.no_grad():
+            if hasattr(m, 'encoder'):
+                enc_hidden, enc_lat = m.encoder(X_train)
+                lat_hidden, _ = m.latent(enc_lat)
+            else:
+                lat_hidden, _ = m(X_train)
+        return lat_hidden.detach().cpu().numpy()
 
-    h = lat_hidden.cpu().numpy()  # [T, B, H]
+    h = _get_h(model)
     T, B, H = h.shape
 
     seq_chars = np.asarray([list(s) for s in np.asarray(seq_train)])  # [B, T]
@@ -181,6 +204,7 @@ def pca_latent_residual(model, X_train, seq_train, save_dir=SAVE_DIR):
 
     z_token_res = project(h_token_res)
     z_minus_drift = project(h_minus_drift)
+    # (single-model) no additional projections
 
     # ===== plot 1: time gradient =====
     def plot_time(z, name):
@@ -245,20 +269,72 @@ def pca_latent_residual(model, X_train, seq_train, save_dir=SAVE_DIR):
     plot_token_time(z_minus_drift, 'latent_minus_drift.svg')
 
 
+def pca_trajectory_level(model, X, labels, types, save_dir=SAVE_DIR):
+    """Trajectory-level PCA: concatenate hidden states across timesteps for each sequence.
+    
+    For each sequence n, concatenate hidden states across timesteps:
+    z^(n) = [h^(n)_1, h^(n)_2, ..., h^(n)_T] ∈ ℝ^(T·d)
+    
+    Then stack all sequences to form Z ∈ ℝ^(N × T·d) and perform PCA.
+    """
+    os.makedirs(save_dir, exist_ok=True)
+
+    with torch.no_grad():
+        lat_hidden, _ = model(X)
+        h = lat_hidden.detach().cpu().numpy()  # [T, B, H]
+    T, B, H = h.shape
+
+    # Reshape to [B, T*H] - concatenate timesteps for each sequence
+    h_trajectory = h.transpose(1, 0, 2).reshape(B, T * H)  # [B, T*H]
+
+    # PCA with 3 components
+    pca = PCA(n_components=min(3, h_trajectory.shape[1]))
+    h_3d = pca.fit_transform(h_trajectory)  # [B, 3]
+
+    type_labels = np.array(labels)
+    unique_types = np.unique(type_labels)
+
+    fig, ax = plt.subplots(figsize=(PLOT_SIZE, PLOT_SIZE))
+    colors = plt.cm.tab10.colors
+    for type_idx in unique_types:
+        mask = type_labels == type_idx
+        type_label = str(types[int(type_idx)]) if types is not None else f'type {int(type_idx)}'
+        ax.scatter(h_3d[mask, 1], h_3d[mask, 2], color=colors[type_idx % len(colors)], s=50, label=type_label, alpha=0.8, edgecolors='none')
+
+    ax.set_xlabel(f'PC2 ({pca.explained_variance_ratio_[1] * 100:.1f}%)')
+    ax.set_ylabel(f'PC3 ({pca.explained_variance_ratio_[2] * 100:.1f}%)')
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=8, loc='upper right')
+    ax.set_aspect('equal')
+    ax.set_box_aspect(1)
+
+    fig.tight_layout()
+    fig.savefig(os.path.join(save_dir, 'latent_trajectory_pca.svg'), dpi=200)
+    plt.close(fig)
+
 
 def train_linear_decoders(model, X_train, seq_train, X_test, seq_test, save_dir=SAVE_DIR,
     n_epochs=500, lr=1e-2, latent_hidden_train_list=None, latent_hidden_test_list=None):
     os.makedirs(save_dir, exist_ok=True)
 
-    if latent_hidden_train_list is None or latent_hidden_test_list is None:
-        model.eval()
+    def _make_latent_lists(m):
+        if m is None:
+            return None, None
+        m.eval()
         with torch.no_grad():
-            _, enc_lat_train = model.encoder(X_train)
-            lat_hidden_train, _ = model.latent(enc_lat_train)
-            _, enc_lat_test = model.encoder(X_test)
-            lat_hidden_test, _ = model.latent(enc_lat_test)
-        latent_hidden_train_list = [lat_hidden_train.detach().cpu().numpy().astype(np.float64)]
-        latent_hidden_test_list = [lat_hidden_test.detach().cpu().numpy().astype(np.float64)]
+            if hasattr(m, 'encoder'):
+                _, enc_lat_train = m.encoder(X_train)
+                lat_hidden_train, _ = m.latent(enc_lat_train)
+                _, enc_lat_test = m.encoder(X_test)
+                lat_hidden_test, _ = m.latent(enc_lat_test)
+            else:
+                lat_hidden_train, _ = m(X_train)
+                lat_hidden_test, _ = m(X_test)
+        return [lat_hidden_train.detach().cpu().numpy().astype(np.float64)], [lat_hidden_test.detach().cpu().numpy().astype(np.float64)]
+
+    if latent_hidden_train_list is None or latent_hidden_test_list is None:
+        latent_hidden_train_list, latent_hidden_test_list = _make_latent_lists(model)
+    # (single-model) latent lists already built above or provided by caller
 
     if len(latent_hidden_train_list) != len(latent_hidden_test_list):
         raise ValueError('latent_hidden_train_list and latent_hidden_test_list must have the same length.')
@@ -280,68 +356,78 @@ def train_linear_decoders(model, X_train, seq_train, X_test, seq_test, save_dir=
     token_train_histories, token_test_histories = [], []
     position_train_histories, position_test_histories = [], []
 
-    for lat_hidden_train_np, lat_hidden_test_np in zip(latent_hidden_train_list, latent_hidden_test_list):
-        hidden_flat_train = torch.tensor(
-            lat_hidden_train_np.transpose(1, 0, 2).reshape(T * B_train, H),
-            dtype=torch.float,
-            device=device,
-        )
-        hidden_flat_test = torch.tensor(
-            lat_hidden_test_np.transpose(1, 0, 2).reshape(T * B_test, H),
-            dtype=torch.float,
-            device=device,
-        )
+    def _train_on_latents(latent_train_list, latent_test_list):
+        token_histories = []
+        position_histories = []
+        for lat_hidden_train_np, lat_hidden_test_np in zip(latent_train_list, latent_test_list):
+            hidden_flat_train = torch.tensor(
+                lat_hidden_train_np.transpose(1, 0, 2).reshape(T * B_train, H),
+                dtype=torch.float,
+                device=device,
+            )
+            hidden_flat_test = torch.tensor(
+                lat_hidden_test_np.transpose(1, 0, 2).reshape(T * B_test, H),
+                dtype=torch.float,
+                device=device,
+            )
 
-        token_train_acc_history, token_test_acc_history = [], []
-        token_decoder = torch.nn.Linear(H, alpha).to(device)
-        optimizer_token = torch.optim.Adam(token_decoder.parameters(), lr=lr)
-        for _ in range(n_epochs):
-            token_decoder.train()
-            optimizer_token.zero_grad()
-            logits = token_decoder(hidden_flat_train)
-            loss = F.cross_entropy(logits, token_labels_flat_train)
-            loss.backward()
-            optimizer_token.step()
+            token_train_acc_history, token_test_acc_history = [], []
+            token_decoder = torch.nn.Linear(H, alpha).to(device)
+            optimizer_token = torch.optim.Adam(token_decoder.parameters(), lr=lr)
+            for _ in range(n_epochs):
+                token_decoder.train()
+                optimizer_token.zero_grad()
+                logits = token_decoder(hidden_flat_train)
+                loss = F.cross_entropy(logits, token_labels_flat_train)
+                loss.backward()
+                optimizer_token.step()
 
-            token_decoder.eval()
-            with torch.no_grad():
-                logits_train = token_decoder(hidden_flat_train)
-                pred_train = torch.argmax(logits_train, dim=-1)
-                train_acc = (pred_train == token_labels_flat_train).float().mean().item()
-                token_train_acc_history.append(train_acc)
+                token_decoder.eval()
+                with torch.no_grad():
+                    logits_train = token_decoder(hidden_flat_train)
+                    pred_train = torch.argmax(logits_train, dim=-1)
+                    train_acc = (pred_train == token_labels_flat_train).float().mean().item()
+                    token_train_acc_history.append(train_acc)
 
-                logits_test = token_decoder(hidden_flat_test)
-                pred_test = torch.argmax(logits_test, dim=-1)
-                test_acc = (pred_test == token_labels_flat_test).float().mean().item()
-                token_test_acc_history.append(test_acc)
+                    logits_test = token_decoder(hidden_flat_test)
+                    pred_test = torch.argmax(logits_test, dim=-1)
+                    test_acc = (pred_test == token_labels_flat_test).float().mean().item()
+                    token_test_acc_history.append(test_acc)
 
-        position_train_acc_history, position_test_acc_history = [], []
-        position_decoder = torch.nn.Linear(H, T).to(device)
-        optimizer_pos = torch.optim.Adam(position_decoder.parameters(), lr=lr)
-        for _ in range(n_epochs):
-            position_decoder.train()
-            optimizer_pos.zero_grad()
-            logits = position_decoder(hidden_flat_train)
-            loss = F.cross_entropy(logits, position_labels_flat_train)
-            loss.backward()
-            optimizer_pos.step()
+            position_train_acc_history, position_test_acc_history = [], []
+            position_decoder = torch.nn.Linear(H, T).to(device)
+            optimizer_pos = torch.optim.Adam(position_decoder.parameters(), lr=lr)
+            for _ in range(n_epochs):
+                position_decoder.train()
+                optimizer_pos.zero_grad()
+                logits = position_decoder(hidden_flat_train)
+                loss = F.cross_entropy(logits, position_labels_flat_train)
+                loss.backward()
+                optimizer_pos.step()
 
-            position_decoder.eval()
-            with torch.no_grad():
-                logits_train = position_decoder(hidden_flat_train)
-                pred_train = torch.argmax(logits_train, dim=-1)
-                train_acc = (pred_train == position_labels_flat_train).float().mean().item()
-                position_train_acc_history.append(train_acc)
+                position_decoder.eval()
+                with torch.no_grad():
+                    logits_train = position_decoder(hidden_flat_train)
+                    pred_train = torch.argmax(logits_train, dim=-1)
+                    train_acc = (pred_train == position_labels_flat_train).float().mean().item()
+                    position_train_acc_history.append(train_acc)
 
-                logits_test = position_decoder(hidden_flat_test)
-                pred_test = torch.argmax(logits_test, dim=-1)
-                test_acc = (pred_test == position_labels_flat_test).float().mean().item()
-                position_test_acc_history.append(test_acc)
+                    logits_test = position_decoder(hidden_flat_test)
+                    pred_test = torch.argmax(logits_test, dim=-1)
+                    test_acc = (pred_test == position_labels_flat_test).float().mean().item()
+                    position_test_acc_history.append(test_acc)
 
-        token_train_histories.append(token_train_acc_history)
-        token_test_histories.append(token_test_acc_history)
-        position_train_histories.append(position_train_acc_history)
-        position_test_histories.append(position_test_acc_history)
+            token_histories.append((token_train_acc_history, token_test_acc_history))
+            position_histories.append((position_train_acc_history, position_test_acc_history))
+        return token_histories, position_histories
+
+    token_histories_a, position_histories_a = _train_on_latents(latent_hidden_train_list, latent_hidden_test_list)
+    token_train_histories = [h[0] for h in token_histories_a]
+    token_test_histories = [h[1] for h in token_histories_a]
+    position_train_histories = [h[0] for h in position_histories_a]
+    position_test_histories = [h[1] for h in position_histories_a]
+
+    # single-model only: no second-model histories
 
     token_train_acc_history = np.mean(np.asarray(token_train_histories), axis=0)
     token_test_acc_history = np.mean(np.asarray(token_test_histories), axis=0)
@@ -370,8 +456,8 @@ def train_linear_decoders(model, X_train, seq_train, X_test, seq_test, save_dir=
     token_chance = 1.0 / alpha
     position_chance = 1.0 / T
     
-    axes[0].plot(epochs_x, smooth(token_train_acc_history), label='Train (mean)', linewidth=1.5)
-    axes[0].plot(epochs_x, smooth(token_test_acc_history), label='Test (mean)', linewidth=1.5)
+    axes[0].plot(epochs_x, smooth(token_train_acc_history), label='Train (mean A)', linewidth=1.5)
+    axes[0].plot(epochs_x, smooth(token_test_acc_history), label='Test (mean A)', linewidth=1.5)
     axes[0].set_xlabel('Epoch')
     axes[0].set_ylabel('Accuracy')
     axes[0].set_title('Token')
@@ -380,8 +466,8 @@ def train_linear_decoders(model, X_train, seq_train, X_test, seq_test, save_dir=
     axes[0].grid(True, alpha=0.3)
     axes[0].legend()
     
-    axes[1].plot(epochs_x, smooth(position_train_acc_history), label='Train (mean)', linewidth=1.5)
-    axes[1].plot(epochs_x, smooth(position_test_acc_history), label='Test (mean)', linewidth=1.5)
+    axes[1].plot(epochs_x, smooth(position_train_acc_history), label='Train (mean A)', linewidth=1.5)
+    axes[1].plot(epochs_x, smooth(position_test_acc_history), label='Test (mean A)', linewidth=1.5)
     axes[1].set_xlabel('Epoch')
     axes[1].set_ylabel('Accuracy')
     axes[1].set_title('Position')
@@ -404,8 +490,11 @@ def train_linear_decoders(model, X_train, seq_train, X_test, seq_test, save_dir=
 
 def _latent_hidden_numpy(model, X):
     with torch.no_grad():
-        _, enc_lat = model.encoder(X)
-        lat_hidden, _ = model.latent(enc_lat)
+        if hasattr(model, 'encoder'):
+            _, enc_lat = model.encoder(X)
+            lat_hidden, _ = model.latent(enc_lat)
+        else:
+            lat_hidden, _ = model(X)
     return lat_hidden.detach().cpu().numpy().astype(np.float64)
 
 
@@ -627,8 +716,11 @@ def hidden_participation_ratio(model, X, labels=None, types=None, save_dir=SAVE_
 
     if block_hidden_list is None or len(block_hidden_list) == 0:
         with torch.no_grad():
-            _, enc_lat = model.encoder(X)
-            lat_hidden, _ = model.latent(enc_lat)
+            if hasattr(model, 'encoder'):
+                _, enc_lat = model.encoder(X)
+                lat_hidden, _ = model.latent(enc_lat)
+            else:
+                lat_hidden, _ = model(X)
         block_hidden_list = [{
             'latent': lat_hidden.detach().cpu().numpy(),
         }]
@@ -725,28 +817,37 @@ def hidden_participation_ratio(model, X, labels=None, types=None, save_dir=SAVE_
 
 def _get_block_hidden_and_weight(model, X):
     with torch.no_grad():
-        enc_hidden, enc_lat = model.encoder(X)
-        lat_hidden, lat_out = model.latent(enc_lat)
-        dec_hidden, _ = model.decoder.rnn(lat_out)
+        if hasattr(model, 'encoder'):
+            enc_hidden, enc_lat = model.encoder(X)
+            lat_hidden, lat_out = model.latent(enc_lat)
+            dec_hidden, _ = model.decoder.rnn(lat_out)
+            return {
+                'encoder': {
+                    'hidden': enc_hidden.detach().cpu().numpy().astype(np.float64),
+                    'weight': model.encoder.rnn.h2h.weight.detach().cpu().numpy().astype(np.float64),
+                },
+                'latent': {
+                    'hidden': lat_hidden.detach().cpu().numpy().astype(np.float64),
+                    'weight': model.latent.h2h.weight.detach().cpu().numpy().astype(np.float64),
+                },
+                'decoder': {
+                    'hidden': dec_hidden.detach().cpu().numpy().astype(np.float64),
+                    'weight': model.decoder.rnn.h2h.weight.detach().cpu().numpy().astype(np.float64),
+                },
+            }
+        else:
+            # single RNN
+            hidden, _ = model(X)
+            return {
+                'rnn': {
+                    'hidden': hidden.detach().cpu().numpy().astype(np.float64),
+                    'weight': model.h2h.weight.detach().cpu().numpy().astype(np.float64),
+                }
+            }
 
-    return {
-        'encoder': {
-            'hidden': enc_hidden.detach().cpu().numpy().astype(np.float64),
-            'weight': model.encoder.rnn.h2h.weight.detach().cpu().numpy().astype(np.float64),
-        },
-        'latent': {
-            'hidden': lat_hidden.detach().cpu().numpy().astype(np.float64),
-            'weight': model.latent.h2h.weight.detach().cpu().numpy().astype(np.float64),
-        },
-        'decoder': {
-            'hidden': dec_hidden.detach().cpu().numpy().astype(np.float64),
-            'weight': model.decoder.rnn.h2h.weight.detach().cpu().numpy().astype(np.float64),
-        },
-    }
 
 
-
-def confusion_matrices(pred, target, n_classes=None, labels=None,save_path=None, vmax=None, cmap='cividis'):
+def confusion_matrices(pred, target, n_classes=None, labels=None,cmap='cividis'):
 
     # convert to numpy (ensure ints)
     if hasattr(pred, 'cpu'):
@@ -782,13 +883,13 @@ def confusion_matrices(pred, target, n_classes=None, labels=None,save_path=None,
     row_sums[row_sums == 0] = 1.0
     props = counts_f / row_sums
 
-    # prepare plot
-    if save_path is None:
-        save_path = os.path.join(SAVE_DIR, 'confusion_matrix.svg')
+    save_path = os.path.join(SAVE_DIR, 'confusion_matrix.svg')
 
+    print("Confusion matrix:")
     fig, ax = plt.subplots(figsize=(3.2, 3))
+    print("Counts:")
     im = ax.imshow(props, interpolation='nearest', cmap=cmap, aspect='equal', vmin=0.0, vmax=1.0)
-
+    
     Cdim = props.shape[0]
     for r in range(Cdim):
         for c in range(Cdim):
@@ -796,7 +897,7 @@ def confusion_matrices(pred, target, n_classes=None, labels=None,save_path=None,
             txt = f'{val:.2f}' if val > 0 else ''
             color = 'white' if val < 0.7 else 'gray'
             ax.text(c, r, txt, ha='center', va='center', color=color, fontsize=8)
-
+    
     ax.set_xticks(range(len(labels)))
     ax.set_xticklabels(labels, rotation=0, fontsize=PLOT_FONT)
     ax.set_yticks(range(len(labels)))
@@ -813,7 +914,12 @@ def confusion_matrices(pred, target, n_classes=None, labels=None,save_path=None,
 def whh_ablation(model, X_train, X_test, test_labels, train_labels=None, types=None, n_epochs=None):
 
     # create fresh model to train under ablated condition
-    pert = model(alpha, d_hidden, d_latent_hidden, num_layers, d_latent, L).to(device)
+    # support both RNNAutoencoder and single RNN
+    if isinstance(model, RNNAutoencoder):
+        pert = RNNAutoencoder(alpha, d_hidden, d_latent_hidden, num_layers, d_latent, L).to(device)
+    else:
+        # single RNN: output dim = alpha (classification over letters)
+        pert = RNN(alpha, d_hidden, num_layers, alpha, output_activation='softmax').to(device)
 
     def _zero_and_freeze_whh(m):
         # zero full-rank weight if present
@@ -837,19 +943,25 @@ def whh_ablation(model, X_train, X_test, test_labels, train_labels=None, types=N
         for p in m.parameters():
             p.requires_grad = False
 
-    # zero & freeze encoder, latent, decoder Whh if available
-    try:
-        _zero_and_freeze_whh(pert.encoder.rnn.h2h)
-    except Exception:
-        pass
-    try:
-        _zero_and_freeze_whh(pert.latent.h2h)
-    except Exception:
-        pass
-    try:
-        _zero_and_freeze_whh(pert.decoder.rnn.h2h)
-    except Exception:
-        pass
+    # zero & freeze Whh depending on model type
+    if hasattr(pert, 'encoder'):
+        try:
+            _zero_and_freeze_whh(pert.encoder.rnn.h2h)
+        except Exception:
+            pass
+        try:
+            _zero_and_freeze_whh(pert.latent.h2h)
+        except Exception:
+            pass
+        try:
+            _zero_and_freeze_whh(pert.decoder.rnn.h2h)
+        except Exception:
+            pass
+    else:
+        try:
+            _zero_and_freeze_whh(pert.h2h)
+        except Exception:
+            pass
 
     # train perturbed model normally (Whh stay zero because frozen)
     train(pert, X_train, X_test, test_labels, train_labels=train_labels, types=types,
@@ -858,7 +970,12 @@ def whh_ablation(model, X_train, X_test, test_labels, train_labels=None, types=N
     # evaluate
     pert.eval()
     with torch.no_grad():
-        _, _, output = pert(X_test)
+        out = pert(X_test)
+        if isinstance(out, tuple) and len(out) == 3:
+            _, _, output = out
+        else:
+            # single RNN returns (hidden, output)
+            _, output = out
     pred = torch.argmax(output, dim=-1)
     target = torch.argmax(X_test, dim=-1)
     acc = (pred == target).all(dim=0).float().mean().item()
@@ -882,8 +999,8 @@ def heatmap_whh(seeds, save_dir=SAVE_DIR):
         test_labels = torch.tensor(labels_test, dtype=torch.long)
         train_labels = torch.tensor(labels_train, dtype=torch.long)
 
-        # create and train model
-        model = RNNAutoencoder(alpha, d_hidden, d_latent_hidden, num_layers, d_latent, L).to(device)
+        # create and train model (single RNN)
+        model = RNN(alpha, d_hidden, num_layers, alpha, output_activation='softmax').to(device)
         train(model, X_train, X_test, test_labels, train_labels=train_labels, types=types,
                         n_epochs=1000, lr=lr, weight_decay=weight_decay, print_final=False)
 
@@ -905,17 +1022,30 @@ def heatmap_whh(seeds, save_dir=SAVE_DIR):
                 continue
             if len(zero_parts) == 0:
                 with torch.no_grad():
-                    _, _, out = model(X_test)
+                    out = model(X_test)
+                    if isinstance(out, tuple) and len(out) == 3:
+                        _, _, out = out
+                    else:
+                        _, out = out
             else:
                 with torch.no_grad():
                     pert = copy.deepcopy(model)
-                    if 'encoder' in zero_parts:
-                        pert.encoder.rnn.h2h.weight.data.zero_()
-                    if 'latent' in zero_parts:
-                        pert.latent.h2h.weight.data.zero_()
-                    if 'decoder' in zero_parts:
-                        pert.decoder.rnn.h2h.weight.data.zero_()
-                    _, _, out = pert(X_test)
+                    if hasattr(pert, 'encoder'):
+                        if 'encoder' in zero_parts:
+                            pert.encoder.rnn.h2h.weight.data.zero_()
+                        if 'latent' in zero_parts:
+                            pert.latent.h2h.weight.data.zero_()
+                        if 'decoder' in zero_parts:
+                            pert.decoder.rnn.h2h.weight.data.zero_()
+                        out_full = pert(X_test)
+                        if isinstance(out_full, tuple) and len(out_full) == 3:
+                            _, _, out = out_full
+                        else:
+                            _, out = out_full
+                    else:
+                        # single RNN: zero the single h2h
+                        pert.h2h.weight.data.zero_()
+                        _, out = pert(X_test)
 
             pred = torch.argmax(out, dim=-1)
             acc = (pred == target).all(dim=0).float().mean().item()
@@ -940,30 +1070,40 @@ def heatmap_whh(seeds, save_dir=SAVE_DIR):
     return results_sorted
 
 
-def Whh_test(model, X_train, X_test, seq_train, seq_test, save_dir=SAVE_DIR):
+def Whh_test(model, X_test, seq_test):
 
     pert = copy.deepcopy(model)
-    pert.encoder.rnn.h2h.weight.data.zero_()
-    pert.latent.h2h.weight.data.zero_()
-    pert.decoder.rnn.h2h.weight.data.zero_()
+    # zero appropriate h2h depending on model type
+    if hasattr(pert, 'encoder'):
+        try:
+            pert.encoder.rnn.h2h.weight.data.zero_()
+        except Exception:
+            pass
+        try:
+            pert.latent.h2h.weight.data.zero_()
+        except Exception:
+            pass
+        try:
+            pert.decoder.rnn.h2h.weight.data.zero_()
+        except Exception:
+            pass
+    else:
+        pert.h2h.weight.data.zero_()
 
     with torch.no_grad():
-        _, _, test_output_pert = pert(X_test)
+        out = pert(X_test)
+        if isinstance(out, tuple) and len(out) == 3:
+            _, _, test_output_pert = out
+        else:
+            _, test_output_pert = out
         pred_test = torch.argmax(test_output_pert, dim=-1)
         target_test = torch.argmax(X_test, dim=-1)
     acc = (pred_test == target_test).all(dim=0).float().mean().item()
+    print(f'[Whh_test] accuracy: {acc:.4f}')
     confusion_matrices(pred_test, target_test, n_classes=alpha, labels=list(string.ascii_lowercase[:alpha]))
 
-    # Use test data for downstream analyses when evaluating test-time W=0
-    trajectory_pca_latent(pert, X_test, seq_test, save_dir)
-    bwp = _get_block_hidden_and_weight(pert, X_test)
-    # singular_value_curve(save_dir,
-    #                      matrices={'W_enc': bwp['encoder']['weight'], 'W_lat': bwp['latent']['weight'], 'W_dec': bwp['decoder']['weight']},
-    #                      block_order=['W_enc', 'W_lat', 'W_dec'],
-    #                      titles={'W_enc': r'Encoder $W_{hh}$', 'W_lat': r'Latent $W_{hh}$', 'W_dec': r'Decoder $W_{hh}$'},
-    #                      out_name='singular_values')
-
-    print(f'[Whh_test] accuracy: {acc:.4f}')
+    # trajectory_pca_latent(pert, X_test, seq_test, save_dir)
+    
 
 
 def train(model, X_train, X_test, test_labels, train_labels=None, types=None,
@@ -977,7 +1117,14 @@ def train(model, X_train, X_test, test_labels, train_labels=None, types=None,
         optimizer.zero_grad()
 
         X_batch = X_train
-        hidden, latent, output = model(X_batch)
+        out = model(X_batch)
+        # model may return (hidden, latent, output) for RNNAutoencoder
+        # or (hidden, output) for single RNN
+        if isinstance(out, tuple) and len(out) == 3:
+            hidden, latent, output = out
+        else:
+            hidden, output = out
+            latent = hidden
 
         ce_loss = F.cross_entropy(
             output.reshape(-1, output.shape[-1]),
@@ -1007,7 +1154,12 @@ def train(model, X_train, X_test, test_labels, train_labels=None, types=None,
 
         model.eval()
         with torch.no_grad():
-            _, test_latent, test_output = model(X_test)
+            out_test = model(X_test)
+            if isinstance(out_test, tuple) and len(out_test) == 3:
+                _, test_latent, test_output = out_test
+            else:
+                test_latent, test_output = out_test
+
             test_ce_loss = F.cross_entropy(
                 test_output.reshape(-1, test_output.shape[-1]),
                 torch.argmax(X_test, dim=-1).reshape(-1)
@@ -1051,7 +1203,8 @@ def _build_ensemble_block_lists(ensemble_seeds, X_train, X_test, test_labels, tr
 
     for seed_i in ensemble_seeds:
         set_seed(seed_i)
-        model_k = RNNAutoencoder(alpha, d_hidden, d_latent_hidden, num_layers, d_latent, L).to(device)
+        # build single RNN models for ensemble
+        model_k = RNN(alpha, d_hidden, num_layers, alpha, output_activation='softmax').to(device)
         train(
             model_k,
             X_train,
@@ -1067,25 +1220,30 @@ def _build_ensemble_block_lists(ensemble_seeds, X_train, X_test, test_labels, tr
 
         block_hidden_weight = _get_block_hidden_and_weight(model_k, X_test)
         block_hidden_weight_list.append(block_hidden_weight)
-        block_weight_list.append({
-            'encoder': block_hidden_weight['encoder']['weight'],
-            'latent': block_hidden_weight['latent']['weight'],
-            'decoder': block_hidden_weight['decoder']['weight'],
-        })
-        block_hidden_list.append({
-            'encoder': block_hidden_weight['encoder']['hidden'],
-            'latent': block_hidden_weight['latent']['hidden'],
-            'decoder': block_hidden_weight['decoder']['hidden'],
-        })
+        # adapt returned structure for single RNN vs autoencoder
+        if 'encoder' in block_hidden_weight:
+            block_weight_list.append({
+                'encoder': block_hidden_weight['encoder']['weight'],
+                'latent': block_hidden_weight['latent']['weight'],
+                'decoder': block_hidden_weight['decoder']['weight'],
+            })
+            block_hidden_list.append({
+                'encoder': block_hidden_weight['encoder']['hidden'],
+                'latent': block_hidden_weight['latent']['hidden'],
+                'decoder': block_hidden_weight['decoder']['hidden'],
+            })
+        else:
+            # single RNN returns 'rnn'
+            block_weight_list.append({'rnn': block_hidden_weight['rnn']['weight']})
+            block_hidden_list.append({'rnn': block_hidden_weight['rnn']['hidden']})
 
+        # latent hidden for training/test (works for both model types)
         with torch.no_grad():
-            _, enc_lat_train = model_k.encoder(X_train)
-            lat_hidden_train, _ = model_k.latent(enc_lat_train)
-            _, enc_lat_test = model_k.encoder(X_test)
-            lat_hidden_test, _ = model_k.latent(enc_lat_test)
+            lat_hidden_train = _latent_hidden_numpy(model_k, X_train)
+            lat_hidden_test = _latent_hidden_numpy(model_k, X_test)
 
-        latent_hidden_train_list.append(lat_hidden_train.detach().cpu().numpy().astype(np.float64))
-        latent_hidden_test_list.append(lat_hidden_test.detach().cpu().numpy().astype(np.float64))
+        latent_hidden_train_list.append(lat_hidden_train)
+        latent_hidden_test_list.append(lat_hidden_test)
 
     return (
         block_hidden_weight_list,
@@ -1099,7 +1257,8 @@ def _build_ensemble_block_lists(ensemble_seeds, X_train, X_test, test_labels, tr
 def run_experiment():
     set_seed(seed)
 
-    model = RNNAutoencoder(alpha, d_hidden, d_latent_hidden, num_layers, d_latent, L).to(device)
+    # use single RNN model for experiments
+    model = RNN(alpha, d_hidden, num_layers, alpha, output_activation='softmax').to(device)
 
     seq_train, seq_test, labels_train, labels_test, types = generate_instances(alpha, L, m, frac_train=0.8)
     X_train = sequences_to_tensor(seq_train, alpha).to(device)
@@ -1112,11 +1271,11 @@ def run_experiment():
 
     
     # confusion matrices
-    with torch.no_grad():
-        _, _, train_output = model(X_train)
-        pred_train = torch.argmax(train_output, dim=-1)
-        target_train = torch.argmax(X_train, dim=-1)
-    confusion_matrices(pred_train, target_train, n_classes=alpha, labels=list(string.ascii_lowercase[:alpha]))
+    # with torch.no_grad():
+    #     _, _, train_output = model(X_train)
+    #     pred_train = torch.argmax(train_output, dim=-1)
+    #     target_train = torch.argmax(X_train, dim=-1)
+    # confusion_matrices(pred_train, target_train, n_classes=alpha, labels=list(string.ascii_lowercase[:alpha]))
     
     # plotting
     
@@ -1131,39 +1290,15 @@ def run_experiment():
 
     # trajectory_pca_latent(model, X_train, seq_train, save_dir=SAVE_DIR)
     # pca_latent_residual(model, X_train, seq_train, save_dir=SAVE_DIR)
-    # pca_encoder_input(model, X_train, seq_train, save_dir=SAVE_DIR)
+    pca_trajectory_level(model, X_train, labels_train, types, save_dir=SAVE_DIR)
 
-    # Whh_test(model, X_train, X_test, seq_train, seq_test, save_dir=SAVE_DIR)
 
-    # # Whh_ablation
+    # Whh_test(model, X_test, seq_test)
+
+    # Whh_ablation
     # seeds = list(range(seed, seed + 20))
     # heatmap_whh(seeds, save_dir=SAVE_DIR)
 
-    # # encoder Win (i2h)
-    # W_in = model.encoder.rnn.i2h.weight.detach().cpu().numpy().astype(np.float64)
-    # singular_value_curve(matrices={'W_in': W_in}, block_order=['W_in'], titles={'W_in': r'Encoder $W_{in}$'}, save_dir=SAVE_DIR, out_name='singular_values_Win')
-    # Whh_enc = model.encoder.rnn.h2h.weight.detach().cpu().numpy().astype(np.float64)
-    # singular_value_curve(matrices={'Whh_enc': Whh_enc}, block_order=['Whh_enc'], titles={'Whh_enc': r'Encoder $W_{hh}$'}, save_dir=SAVE_DIR, out_name='singular_values_Whh_encoder')
-    # W_out_enc = model.encoder.rnn.h2o.weight.detach().cpu().numpy().astype(np.float64)
-    # singular_value_curve(matrices={'W_out_enc': W_out_enc}, block_order=['W_out_enc'], titles={'W_out_enc': r'Encoder $W_{out}$'}, save_dir=SAVE_DIR, out_name='singular_values_Wout_encoder')
-
-    # # latent Win and Wout
-    # W_in_lat = model.latent.i2h.weight.detach().cpu().numpy().astype(np.float64)
-    # singular_value_curve(matrices={'W_in_lat': W_in_lat}, block_order=['W_in_lat'], titles={'W_in_lat': r'Latent $W_{in}$'}, save_dir=SAVE_DIR, out_name='singular_values_Win_latent')
-    # Whh_lat = model.latent.h2h.weight.detach().cpu().numpy().astype(np.float64)
-    # singular_value_curve(matrices={'Whh_lat': Whh_lat}, block_order=['Whh_lat'], titles={'Whh_lat': r'Latent $W_{hh}$'}, save_dir=SAVE_DIR, out_name='singular_values_Whh_latent')
-    # W_out_lat = model.latent.h2o.weight.detach().cpu().numpy().astype(np.float64)
-    # singular_value_curve(matrices={'W_out_lat': W_out_lat}, block_order=['W_out_lat'], titles={'W_out_lat': r'Latent $W_{out}$'}, save_dir=SAVE_DIR, out_name='singular_values_Wout_latent')
-
-    # # decoder
-    # W_in_dec = model.decoder.rnn.i2h.weight.detach().cpu().numpy().astype(np.float64)
-    # singular_value_curve(matrices={'W_in_dec': W_in_dec}, block_order=['W_in_dec'], titles={'W_in_dec': r'Decoder $W_{in}$'}, save_dir=SAVE_DIR, out_name='singular_values_Win_decoder')
-    # Whh_dec = model.decoder.rnn.h2h.weight.detach().cpu().numpy().astype(np.float64)
-    # singular_value_curve(matrices={'Whh_dec': Whh_dec}, block_order=['Whh_dec'], titles={'Whh_dec': r'Decoder $W_{hh}$'}, save_dir=SAVE_DIR, out_name='singular_values_Whh_decoder') 
-    # W_out = model.decoder.rnn.h2o.weight.detach().cpu().numpy().astype(np.float64)
-    # singular_value_curve(matrices={'W_out': W_out}, block_order=['W_out'], titles={'W_out': r'Decoder $W_{out}$'}, save_dir=SAVE_DIR, out_name='singular_values_Wout')
-    
-    
     # hidden_participation_ratio(model, X_test, labels=labels_test, types=types,
     #     save_dir=SAVE_DIR, block_hidden_list=block_hidden_list)
     
@@ -1171,16 +1306,20 @@ def run_experiment():
     # final evaluation
     model.eval()
     with torch.no_grad():
-        _, z_test, test_output = model(X_test)
+        out = model(X_test)
+        if isinstance(out, tuple) and len(out) == 3:
+            _, z_test, test_output = out
+        else:
+            z_test, test_output = out
         pred_test = torch.argmax(test_output, dim=-1)
         target_test = torch.argmax(X_test, dim=-1)
         test_acc = (pred_test == target_test).all(dim=0).float().mean().item()
 
-    # train_acc = history['train_acc'][-1] if len(history['train_acc']) > 0 else 0.0
-    # train_metrics = {'acc': train_acc}
-    # test_metrics = {'acc': test_acc}
+    train_acc = history['train_acc'][-1] if len(history['train_acc']) > 0 else 0.0
+    train_metrics = {'acc': train_acc}
+    test_metrics = {'acc': test_acc}
 
-    # compute_metrics(train_metrics, test_metrics, z_test, labels_test, types)
+    compute_metrics(train_metrics, test_metrics, z_test, labels_test, types)
 
 if __name__ == '__main__':
     run_experiment()

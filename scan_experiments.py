@@ -8,6 +8,8 @@ import pandas as pd
 import torch
 import warnings
 import random
+from matplotlib.colors import Normalize
+import glob
 
 from model import RNNAutoencoder
 from test import (
@@ -27,7 +29,7 @@ from test import (
 
 PLOT_FONT = 13
 SCAN_SPLIT_SEED = 2024
-LMA_SCAN_SEEDS = list(range(40, 51))
+LMA_SCAN_SEEDS = list(range(35, 55))
 CONTROL_TASK = {'L': 6, 'm': 2, 'alpha': 4}
 HIDDEN_VALUES = [2, 4, 8, 16, 32]
 HIDDEN_GRID_SEEDS = list(range(10))
@@ -82,19 +84,11 @@ def _run_single_lma_scan(alpha_v, L_v, d_hidden_v, d_latent_hidden_v, seed_v, n_
     if len(w) > 0:
         msgs = [str(x.message) for x in w]
         print(f"Warnings encountered during run (seed={seed_v}): {msgs}")
-        return None
     return {
         'train_acc': float(history['train_acc'][-1]),
         'test_acc': float(history['test_acc'][-1]),
     }
 
-
-def _plot_curve_with_std(ax, x_vals, means, stds, color, label):
-    x = np.array(x_vals, dtype=float)
-    y = np.array(means, dtype=float)
-    s = np.array(stds, dtype=float)
-    ax.plot(x, y, color=color, linewidth=2.2, marker='o', markersize=6, label=label)
-    ax.fill_between(x, y - s, y + s, color=color, alpha=0.22, linewidth=0)
 
 
 def L_m_alpha_scan(save_dir=None, n_epochs=None):
@@ -104,9 +98,9 @@ def L_m_alpha_scan(save_dir=None, n_epochs=None):
     checkpoint_path = os.path.join(run_dir, 'three_experiments_results_checkpoint.csv')
 
     experiments = [
-        {'name': 'Experiment 1', 'scan': 'alpha', 'values': [2, 4, 6, 8, 10], 'fixed': {'L': 4, 'm': 2}, 'seeds': LMA_SCAN_SEEDS},
+        {'name': 'Experiment 1', 'scan': 'alpha', 'values': [4, 6, 8, 10, 12], 'fixed': {'L': 4, 'm': 2}, 'seeds': LMA_SCAN_SEEDS},
         {'name': 'Experiment 2', 'scan': 'L', 'values': [4, 5, 6, 7, 8], 'fixed': {'alpha': 6, 'm': 2}, 'seeds': LMA_SCAN_SEEDS},
-        {'name': 'Experiment 3', 'scan': 'm', 'values': [1, 2, 3], 'fixed': {'alpha': 6, 'L': 6}, 'seeds': LMA_SCAN_SEEDS},
+        {'name': 'Experiment 3', 'scan': 'm', 'values': [2, 3, 4, 5, 6], 'fixed': {'alpha': 6, 'L': 6}, 'seeds': LMA_SCAN_SEEDS},
     ]
 
     all_results = []
@@ -121,35 +115,24 @@ def L_m_alpha_scan(save_dir=None, n_epochs=None):
             alpha_v, L_v, m_v = params['alpha'], params['L'], params['m']
             X_train, X_test, test_labels = _build_fixed_scan_data(alpha_v, L_v, m_v, SCAN_SPLIT_SEED, device)
             for sd in seeds:
-                # try the provided seed, but if warnings occur, replace with other seeds (up to max attempts)
-                tried = set([int(sd)])
-                attempts = 0
-                max_replacements = 5
                 current_seed = int(sd)
-                while True:
-                    print(f"{exp['name']} -> {scan_key}={sv}, seed={current_seed} (alpha={alpha_v}, L={L_v}, m={m_v})")
-                    metrics = _run_single_lma_scan(alpha_v, L_v, d_hidden_v=4, d_latent_hidden_v=2,
-                        seed_v=current_seed, n_epochs_v=n_epochs, device_v=device,
-                        X_train=X_train, X_test=X_test, test_labels=test_labels)
-                    if metrics is None:
-                        attempts += 1
-                        print(f"Run produced warnings, discarding seed {current_seed} (attempt {attempts}/{max_replacements}).")
-                        if attempts >= max_replacements:
-                            print("Max replacement attempts reached; skipping this seed.")
-                            break
-                        # pick a new seed not tried yet
-                        new_seed = int(np.random.randint(0, 100000))
-                        while new_seed in tried:
-                            new_seed = int(np.random.randint(0, 100000))
-                        tried.add(new_seed)
-                        current_seed = new_seed
-                        continue
+                print(f"{exp['name']} -> {scan_key}={sv}, seed={current_seed} (alpha={alpha_v}, L={L_v}, m={m_v})")
+                metrics = _run_single_lma_scan(alpha_v, L_v, d_hidden_v=4, d_latent_hidden_v=2,
+                    seed_v=current_seed, n_epochs_v=n_epochs, device_v=device,
+                    X_train=X_train, X_test=X_test, test_labels=test_labels)
+                if metrics is None:
+                    print(f"Run produced warnings for seed {current_seed}; recording NaN results and continuing.")
                     all_results.append({
                         'experiment': exp['name'], 'scan_param': scan_key, 'scan_value': sv, 'seed': current_seed,
-                        'alpha': alpha_v, 'L': L_v, 'm': m_v, **metrics,
+                        'alpha': alpha_v, 'L': L_v, 'm': m_v, 'train_acc': float('nan'), 'test_acc': float('nan'),
                     })
                     _safe_write_csv(pd.DataFrame(all_results), checkpoint_path)
-                    break
+                    continue
+                all_results.append({
+                    'experiment': exp['name'], 'scan_param': scan_key, 'scan_value': sv, 'seed': current_seed,
+                    'alpha': alpha_v, 'L': L_v, 'm': m_v, **metrics,
+                })
+                _safe_write_csv(pd.DataFrame(all_results), checkpoint_path)
 
     df_raw = pd.DataFrame(all_results)
     csv_path = _safe_write_csv(df_raw, os.path.join(run_dir, 'three_experiments_results.csv'))
@@ -166,30 +149,51 @@ def L_m_alpha_scan(save_dir=None, n_epochs=None):
     if dropped > 0:
         print(f"Dropped {dropped} runs with invalid accuracies (warnings encountered).")
 
-    fig, axes = plt.subplots(1, 3, figsize=(9.5, 3), constrained_layout=True)
-    colors = {'train': '#1f77b4', 'test': '#ff7f0e'}
-    for ax, exp in zip(axes, experiments):
+    # For each experiment (alpha, L, m) build a seed x value matrix of test accuracies
+    figsaved_paths = []
+    cmap = plt.get_cmap('cividis')
+    for exp in experiments:
         sub = df[df['experiment'] == exp['name']]
-        x_vals = exp['values']
-        train_stats = sub.groupby('scan_value')['train_acc'].agg(['mean', 'std']).reindex(x_vals)
-        test_stats = sub.groupby('scan_value')['test_acc'].agg(['mean', 'std']).reindex(x_vals)
-        _plot_curve_with_std(ax, x_vals, train_stats['mean'].values, train_stats['std'].fillna(0).values, colors['train'], 'Train Acc')
-        _plot_curve_with_std(ax, x_vals, test_stats['mean'].values, test_stats['std'].fillna(0).values, colors['test'], 'Test Acc')
+        vals = list(exp['values'])
+        # pivot to rows=seed, cols=scan_value
+        pivot = sub.pivot_table(index='seed', columns='scan_value', values='test_acc', aggfunc='mean')
+        # ensure rows correspond to the scan seeds (keep order), fill missing with NaN
+        pivot_full = pivot.reindex(LMA_SCAN_SEEDS)
+        # ensure columns are in the expected order
+        pivot_full = pivot_full.reindex(columns=vals)
+        # compute per-seed mean (across scan values) to sort rows ascending
+        row_mean = pivot_full.mean(axis=1, skipna=True)
+        sort_idx = row_mean.sort_values(na_position='last').index
+        pivot_sorted = pivot_full.loc[sort_idx]
+
+        # plot heatmap
+        fig, ax = plt.subplots(figsize=(3.2, 3.0))
+        im = ax.imshow(pivot_sorted.values, origin='lower', aspect='auto', cmap=cmap, vmin=0.0, vmax=1.0, interpolation='nearest')
         ax.set_title(exp['name'])
         ax.set_xlabel(exp['scan'])
-        ax.set_xticks(x_vals)
-        ax.set_ylim(0, 1.05)
-        ax.grid(True, alpha=0.28, linestyle=':')
-
-    axes[0].set_ylabel('Accuracy')
-    axes[-1].legend(loc='lower right', fontsize=10, frameon=True)
-    fig_path = os.path.join(run_dir, 'three_experiments_acc.svg')
-    fig.savefig(fig_path, dpi=180)
-    plt.close(fig)
+        ax.set_xticks(np.arange(len(vals)))
+        ax.set_xticklabels([str(v) for v in vals])
+        # show seed indices on y-axis (in sorted order)
+        y_ticks = np.arange(len(pivot_sorted.index))
+        # use seed labels; convert to string for readability
+        ax.set_yticks(y_ticks)
+        ax.set_yticklabels([str(int(s)) if not np.isnan(s) else '' for s in pivot_sorted.index])
+        ax.set_ylabel('Simulations')
+        # colorbar
+        sm = plt.cm.ScalarMappable(cmap=cmap, norm=Normalize(vmin=0, vmax=1))
+        sm.set_array(np.linspace(0, 1, 256))
+        cbar = fig.colorbar(sm, ax=ax, fraction=0.05, pad=0.04)
+        cbar.set_label('Accuracy', fontsize=PLOT_FONT)
+        fig.tight_layout()
+        fig_path = os.path.join(run_dir, f"scan_{exp['scan']}_heatmap.svg")
+        fig.savefig(fig_path, dpi=180, bbox_inches='tight')
+        plt.close(fig)
+        figsaved_paths.append(fig_path)
 
     print(f"Run directory: {run_dir}")
     print(f"Saved csv: {csv_path}")
-    print(f"Saved plot: {fig_path}")
+    for p in figsaved_paths:
+        print(f"Saved plot: {p}")
     return df
 
 
@@ -213,46 +217,10 @@ def _run_hidden_grid_once(alpha_v, L_v, m_v, d_hidden_v, d_latent_hidden_v, seed
     if len(w) > 0:
         msgs = [str(x.message) for x in w]
         print(f"Warnings encountered during hidden-grid run (seed={seed_v}): {msgs}")
-        return None
     return {
         'train_acc': float(history['train_acc'][-1]),
         'test_acc': float(history['test_acc'][-1]),
     }
-
-
-def _plot_hidden_heatmap(df, phase, save_dir):
-    value_col = f'{phase}_acc'
-    mean_table = df.groupby(['d_latent_hidden', 'd_hidden'])[value_col].mean().unstack()
-    std_table = df.groupby(['d_latent_hidden', 'd_hidden'])[value_col].std(ddof=0).unstack()
-
-    fig, ax = plt.subplots(figsize=(5.2, 4.3))
-    im = ax.imshow(mean_table.values, cmap='viridis', aspect='auto', origin='lower', vmin=0, vmax=1)
-    ax.set_xticks(np.arange(len(mean_table.columns)))
-    ax.set_xticklabels([str(int(v)) for v in mean_table.columns])
-    ax.set_yticks(np.arange(len(mean_table.index)))
-    ax.set_yticklabels([str(int(v)) for v in mean_table.index])
-    ax.set_xlabel('d_hidden', fontsize=PLOT_FONT)
-    ax.set_ylabel('d_latent_hidden', fontsize=PLOT_FONT)
-    ax.set_title(f'{phase.capitalize()} Accuracy', fontsize=PLOT_FONT)
-
-    for i in range(len(mean_table.index)):
-        for j in range(len(mean_table.columns)):
-            mean_val = mean_table.iloc[i, j]
-            std_val = std_table.iloc[i, j]
-            if np.isnan(mean_val):
-                continue
-            text_color = 'white' if mean_val < 0.55 else 'black'
-            ax.text(j, i, f'{mean_val:.2f}\n±{0.0 if np.isnan(std_val) else std_val:.2f}',
-                ha='center', va='center', color=text_color, fontsize=8)
-
-    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    cbar.set_label(f'{phase.capitalize()} accuracy', fontsize=PLOT_FONT)
-    fig.tight_layout()
-    plot_path = os.path.join(save_dir, f'control_624_{phase}_acc_heatmap.svg')
-    fig.savefig(plot_path, dpi=180)
-    plt.close(fig)
-    return plot_path
-
 
 def hidden_grid_heatmap_scan(save_dir=None, n_epochs=None):
     run_dir = _make_run_dir('control_624_hidden_heatmap') if save_dir is None else save_dir
@@ -372,7 +340,7 @@ def _plot_hidden_seedbars(df_all, phase, save_dir):
 
     cmap = plt.get_cmap('cividis')
 
-    fig, ax = plt.subplots(figsize=(5.2, 4.3))
+    fig, ax = plt.subplots(figsize=(3.5, 3))
     ax.set_xlim(0, n_cols)
     ax.set_ylim(0, n_rows)
     ax.set_xticks(np.arange(n_cols) + 0.5)
@@ -381,7 +349,6 @@ def _plot_hidden_seedbars(df_all, phase, save_dir):
     ax.set_yticklabels([str(int(v)) for v in dl_vals])
     ax.set_xlabel('d_hidden', fontsize=PLOT_FONT)
     ax.set_ylabel('d_latent_hidden', fontsize=PLOT_FONT)
-    ax.set_title(f'{phase.capitalize()}: per-seed accuracies (left→right seeds; heights ∈ [0,1])', fontsize=PLOT_FONT)
 
     for i, dl in enumerate(dl_vals):
         for j, dh in enumerate(dh_vals):
@@ -396,30 +363,108 @@ def _plot_hidden_seedbars(df_all, phase, save_dir):
                 continue
             accs = np.array(sub[value_col].dropna().astype(float))
             if accs.size == 0:
+                # fill cell with neutral background when no runs
+                ax.add_patch(Rectangle((x0, y0), 1.0, 1.0, facecolor='#f0f0f0', edgecolor='none'))
                 continue
-            accs_sorted = np.sort(accs)
-            n = accs_sorted.size
-            # center the sequence of bars within the cell
-            total_width = n * bar_width
-            start_x = x0 + 0.5 - total_width / 2
-            for k, acc in enumerate(accs_sorted):
-                bx = start_x + k * bar_width
-                color = cmap(acc)
-                # bar height scaled to cell height (0..1)
-                height = max(0.001, float(acc)) * 0.95
-                ax.add_patch(Rectangle((bx, y0 + 0.02), bar_width, height, facecolor=color, edgecolor='none', alpha=0.95))
+            accs_sorted = np.sort(accs)  # ascending
+            # draw as a vertical column of 10 tiles (bottom->top: ascending acc)
+            rows = 10
+            # build a small (rows x 1 x 3) RGB image for the cell, then imshow it to avoid gaps
+            tile_colors = np.ones((rows, 1, 3), dtype=float) * 0.94  # default light gray background
+            for r in range(rows):
+                if r < accs_sorted.size:
+                    acc = float(accs_sorted[r])
+                    rgba = cmap(acc)
+                    tile_colors[r, 0, :] = rgba[:3]
+            ax.imshow(tile_colors, origin='lower', aspect='auto', interpolation='nearest',
+                      extent=(x0, x0 + 1, y0, y0 + 1))
 
     # ensure axes increase left->right and bottom->top
     ax.set_xlim(0, n_cols)
     ax.set_ylim(0, n_rows)
+    # add a cividis colorbar matching the tile colors
+    fig.subplots_adjust(right=0.80)
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=Normalize(vmin=0, vmax=1))
+    sm.set_array(np.linspace(0, 1, 256))
+    cbar = fig.colorbar(sm, ax=ax, fraction=0.05, pad=0.05)
+    cbar.set_label('Accuracy', fontsize=PLOT_FONT)
     fig.tight_layout()
     plot_path = os.path.join(save_dir, f'control_624_{phase}_acc_seedbars.svg')
-    fig.savefig(plot_path, dpi=180)
+    fig.savefig(plot_path, dpi=180, bbox_inches='tight')
     plt.close(fig)
     return plot_path
 
-    
+
+def plot_lma_heatmaps_from_csv(csv_path, save_dir=None, phase_col='test_acc', cmap_name='cividis'):
+
+    df = pd.read_csv(csv_path)
+    out_dir = save_dir or os.path.dirname(csv_path)
+    os.makedirs(out_dir, exist_ok=True)
+
+    cmap = plt.get_cmap(cmap_name).copy()
+    cmap.set_bad('#f0f0f0')
+
+    experiments = [
+        ('alpha', sorted(df[df['scan_param'] == 'alpha']['scan_value'].unique())),
+        ('L', sorted(df[df['scan_param'] == 'L']['scan_value'].unique())),
+        ('m', sorted(df[df['scan_param'] == 'm']['scan_value'].unique())),
+    ]
+
+    for scan_key, vals in experiments:
+        sub = df[df['scan_param'] == scan_key]
+        cols = []
+        max_n = 0
+        for v in vals:
+            col_vals = sub[sub['scan_value'] == v][phase_col].dropna().astype(float).values
+            col_sorted = np.sort(col_vals)  # ascending
+            cols.append(col_sorted)
+            if col_sorted.size > max_n:
+                max_n = col_sorted.size
+
+        if max_n == 0:
+            print(f'No data for scan {scan_key} in {csv_path}; skipping.')
+            continue
+
+        # build matrix rows=max_n, cols=len(vals); place sorted values at the bottom
+        mat = np.full((max_n, len(vals)), np.nan, dtype=float)
+        for j, col in enumerate(cols):
+            k = col.size
+            if k > 0:
+                mat[0:k, j] = col  # row 0 is bottom when origin='lower'
+
+        # mask NaNs for clean plotting
+        mat_masked = np.ma.masked_invalid(mat)
+
+        fig, ax = plt.subplots(figsize=(2.9, 3))
+        im = ax.imshow(mat_masked, origin='lower', aspect='auto', cmap=cmap, vmin=0.0, vmax=1.0, interpolation='nearest')
+        ax.set_xlabel(scan_key)
+        ax.set_xticks(np.arange(len(vals)))
+        ax.set_xticklabels([str(v) for v in vals])
+        ax.set_yticks([])  
+        ax.set_ylabel('Simulations')
+
+        sm = plt.cm.ScalarMappable(cmap=cmap, norm=Normalize(vmin=0, vmax=1))
+        sm.set_array(np.linspace(0, 1, 256))
+        cbar = fig.colorbar(sm, ax=ax, fraction=0.05, pad=0.04)
+        cbar.set_label('Accuracy', fontsize=PLOT_FONT)
+
+        fig.tight_layout()
+        out_path = os.path.join(out_dir, f'scan_{scan_key}_heatmap_from_csv.svg')
+        fig.savefig(out_path, dpi=180, bbox_inches='tight')
+        plt.close(fig)
+        print(f'Saved heatmap: {out_path}')
+
+    return True
 
 
 if __name__ == '__main__':
-    hidden_grid_heatmap_scan()
+    # set deterministic split seed
+    set_seed(SCAN_SPLIT_SEED)
+    # try to find an existing CSV for the L/M/alpha scan and plot from it
+    csv_pattern = os.path.join(SAVE_DIR, 'l_m_alpha_scan', '*', 'three_experiments_results.csv')
+    matches = glob.glob(csv_pattern)
+    latest_csv = max(matches, key=os.path.getmtime)
+    print(f'Found existing CSV: {latest_csv} — plotting heatmaps from CSV.')
+    plot_lma_heatmaps_from_csv(latest_csv)
+    print('Plotting from CSV completed.')
+
