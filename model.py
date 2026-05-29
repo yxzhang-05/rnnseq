@@ -188,7 +188,7 @@ class LowRankLinear(FullRankLinear):
 
 class RNN (nn.Module):
 
-    def __init__(self, d_input, d_hidden, num_layers, d_output,
+    def __init__(self, d_input, d_hidden, L, d_output,
             output_activation=None, # choose btw softmax for classification vs linear for regression tasks
             drop_l=None,
             nonlinearity='relu',
@@ -214,6 +214,7 @@ class RNN (nn.Module):
         self.d_input = d_input
         self.d_output = d_output
         self.d_hidden = d_hidden
+        self.L = L
 
         self.i2h = nn.Linear(d_input, d_hidden, bias=0)
 
@@ -222,7 +223,7 @@ class RNN (nn.Module):
         else:
             self.h2h = layer_type(d_hidden, d_hidden, bias=bias)
 
-        self.h2o = nn.Linear(d_hidden, d_output, bias=bias)
+        self.h2o = nn.Linear(d_hidden, d_output * self.L)
 
         if nonlinearity in [None, 'linear']:
             self.phi = lambda x: x
@@ -429,7 +430,9 @@ class RNN (nn.Module):
         hidden = torch.reshape(torch.stack(hidden), _shape)
         # print('after', np.shape(hidden))
 
-        output = self.h2o(hidden)
+        output = self.h2o(hidden[-1])
+        output = output.view(-1, self.L, self.d_output)         # [B, T, D]
+        output = output.permute(1, 0, 2)                          # [T, B, D]
         # print('outputshape', np.shape(output))
 
         return hidden, output
