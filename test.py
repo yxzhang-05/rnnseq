@@ -3,7 +3,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import pandas as pd
-from model import RNN
+from model import RNN, RNNAutoencoder
 from sequences import findStructures, replace_symbols as seq_replace_symbols
 import string
 import itertools
@@ -19,7 +19,9 @@ seed = 42
 L, m, alpha = 4, 2, 6
 epochs = 1000 
 lr = 1e-3
-d_hidden = 32
+d_hidden = 64
+d_latent_hidden = 32
+d_latent = 32
 weight_decay = 1e-3 
 device = torch.device('cpu')
 SAVE_DIR = "results"
@@ -84,18 +86,32 @@ def sequences_to_tensor(sequences, alpha):
 
 def pca_h_t(model, X_train, labels=None, types=None, seq_train=None, save_dir=SAVE_DIR):
     with torch.no_grad():
-        hidden, _ = model(X_train)
-        h_last = hidden[-1].detach().cpu().numpy()
+        # Prefer to obtain latent hidden sequence by running encoder then latent RNN
+        if hasattr(model, 'encoder') and hasattr(model, 'latent'):
+            enc_hidden, enc_latent = model.encoder(X_train)
+            lat_hidden, lat_out = model.latent(enc_latent)
+            latent_seq = lat_hidden
+        else:
+            outs = model(X_train)
+            if isinstance(outs, tuple) and len(outs) == 3:
+                # outs[1] may be latent-out or latent-hidden depending on model; use it
+                latent_seq = outs[1]
+            else:
+                latent_seq = outs[0]
+        h_last = latent_seq[-1].detach().cpu().numpy()
         first_token_ids = torch.argmax(X_train[0], dim=-1).detach().cpu().numpy()
 
     pca = PCA(n_components=min(2, h_last.shape[1]))
     h_2d = pca.fit_transform(h_last)
 
-    labels_np = np.asarray(first_token_ids)
+    labels_np = np.asarray(labels) if labels is not None else np.asarray(first_token_ids)
     unique_labels = np.unique(labels_np)
     muted_palette = ['#5b8e7d', '#c97c5d', '#6c8ebf', '#b07aa1', '#9e9d57', '#6fa3a3']
     colors = muted_palette
-    token_names = list(string.ascii_lowercase[:alpha])
+    if types is not None:
+        token_names = [str(t) for t in types]
+    else:
+        token_names = list(string.ascii_lowercase[:alpha])
 
     fig, ax = plt.subplots(figsize=(PLOT_SIZE, PLOT_SIZE))
     for label_idx in unique_labels:
@@ -130,7 +146,7 @@ def pca_h_t(model, X_train, labels=None, types=None, seq_train=None, save_dir=SA
         ax3d = fig.add_subplot(111, projection='3d')
         for label_idx in unique_labels:
             mask = labels_np == label_idx
-            label_name = token_names[int(label_idx)] if int(label_idx) < len(token_names) else f'token {int(label_idx)}'
+            label_name = token_names[int(label_idx)] if int(label_idx) < len(token_names) else f'type {int(label_idx)}'
             ax3d.scatter(
                 h_3d[mask, 0],
                 h_3d[mask, 1],
@@ -161,8 +177,17 @@ def pca_h_t(model, X_train, labels=None, types=None, seq_train=None, save_dir=SA
 def pca_trajectory_level(model, X, labels, types, save_dir=SAVE_DIR):
 
     with torch.no_grad():
-        lat_hidden, _ = model(X)
-        h = lat_hidden.detach().cpu().numpy()  # [T, B, H]
+        if hasattr(model, 'encoder') and hasattr(model, 'latent'):
+            enc_hidden, enc_latent = model.encoder(X)
+            lat_hidden, lat_out = model.latent(enc_latent)
+            h = lat_hidden.detach().cpu().numpy()
+        else:
+            outs = model(X)
+            if isinstance(outs, tuple) and len(outs) == 3:
+                lat_hidden = outs[1]
+            else:
+                lat_hidden = outs[0]
+            h = lat_hidden.detach().cpu().numpy()  # [T, B, H]
     T, B, H = h.shape
 
     # Reshape to [B, T*H] - concatenate timesteps for each sequence
@@ -172,19 +197,17 @@ def pca_trajectory_level(model, X, labels, types, save_dir=SAVE_DIR):
     pca = PCA(n_components=min(3, h_trajectory.shape[1]))
     h_3d = pca.fit_transform(h_trajectory)  # [B, 3]
 
-    # Color trajectories by the final-step token identity
-    try:
-        last_tokens = np.argmax(X[1].detach().cpu().numpy(), axis=-1)
-    except Exception:
-        last_tokens = np.argmax(X[1], axis=-1)
-
-    token_labels = np.array(last_tokens)
+    # Color trajectories by type labels (provided via `labels` argument)
+    token_labels = np.array(labels) if labels is not None else np.argmax(X[1].detach().cpu().numpy(), axis=-1)
     unique_tokens = np.unique(token_labels)
 
     fig, ax = plt.subplots(figsize=(PLOT_SIZE, PLOT_SIZE))
     muted_palette = ['#5b8e7d', '#c97c5d', '#6c8ebf', '#b07aa1', '#9e9d57', '#6fa3a3']
     colors = muted_palette
-    token_names = list(string.ascii_lowercase[:alpha])
+    if types is not None:
+        token_names = [str(t) for t in types]
+    else:
+        token_names = list(string.ascii_lowercase[:alpha])
     for tok in unique_tokens:
         mask = token_labels == tok
         token_name = token_names[int(tok)] if int(tok) < len(token_names) else f'token {int(tok)}'
@@ -222,8 +245,17 @@ def pca_trajectory_level(model, X, labels, types, save_dir=SAVE_DIR):
 def cosine_similarity(model, X_train, labels, types=None, save_dir=SAVE_DIR):
  
     with torch.no_grad():
-        hidden, _ = model(X_train)
-        h_last = hidden[-1].detach().cpu().numpy()
+        if hasattr(model, 'encoder') and hasattr(model, 'latent'):
+            enc_hidden, enc_latent = model.encoder(X_train)
+            lat_hidden, lat_out = model.latent(enc_latent)
+            h_last = lat_hidden[-1].detach().cpu().numpy()
+        else:
+            outs = model(X_train)
+            if isinstance(outs, tuple) and len(outs) == 3:
+                latent = outs[1]
+            else:
+                latent = outs[0]
+            h_last = latent[-1].detach().cpu().numpy()
 
     labels_np = np.asarray(labels)
        
@@ -267,7 +299,7 @@ def cosine_similarity(model, X_train, labels, types=None, save_dir=SAVE_DIR):
     plt.close(fig)
 
 
-def confusion_matrices(pred, target, n_classes=None, labels=None,cmap='cividis'):
+def confusion_matrices(pred, target, n_classes=None, labels=None, cmap='cividis'):
 
     # convert to numpy (ensure ints)
     if hasattr(pred, 'cpu'):
@@ -282,50 +314,66 @@ def confusion_matrices(pred, target, n_classes=None, labels=None,cmap='cividis')
     pred_np = pred_np.astype(int)
     target_np = target_np.astype(int)
 
-    # flatten over time and batch to aggregate counts
-    if pred_np.ndim == 1:
-        y_pred_all = pred_np
-        y_true_all = target_np
-    else:
-        y_pred_all = pred_np.reshape(-1)
-        y_true_all = target_np.reshape(-1)
-
     labels = list(labels) if labels is not None else list(range(n_classes))
-
-    counts = np.zeros((n_classes, n_classes), dtype=int)
-    for yt, yp in zip(y_true_all, y_pred_all):
-        counts[int(yt), int(yp)] += 1
-
-    # Convert to proportions per true class (row-normalized) in [0,1]
-    counts_f = counts.astype(float)
-    row_sums = counts_f.sum(axis=1, keepdims=True)
-    # avoid div-by-zero
-    row_sums[row_sums == 0] = 1.0
-    props = counts_f / row_sums
-
-    save_path = os.path.join(SAVE_DIR, 'confusion_matrix.svg')
-
-    print("Confusion matrix:")
-    fig, ax = plt.subplots(figsize=(3.2, 3))
-    print("Counts:")
-    im = ax.imshow(props, interpolation='nearest', cmap=cmap, aspect='equal', vmin=0.0, vmax=1.0)
     
-    Cdim = props.shape[0]
-    for r in range(Cdim):
-        for c in range(Cdim):
-            val = props[r, c]
-            txt = f'{val:.2f}' if val > 0 else ''
-            color = 'white' if val < 0.7 else 'gray'
-            ax.text(c, r, txt, ha='center', va='center', color=color, fontsize=8)
+    # Handle 3D case: [T, B, C] -> [T, B]
+    if pred_np.ndim == 3:
+        pred_np = np.argmax(pred_np, axis=-1)
     
-    ax.set_xticks(range(len(labels)))
-    ax.set_xticklabels(labels, rotation=0, fontsize=PLOT_FONT)
-    ax.set_yticks(range(len(labels)))
-    ax.set_yticklabels(labels, fontsize=PLOT_FONT)
-    ax.set_xlabel('Reconstructed', fontsize=PLOT_FONT)
-    ax.set_ylabel('True', fontsize=PLOT_FONT)
-    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    # Ensure target is 2D [T, B]
+    if target_np.ndim == 1:
+        # If target is 1D, reshape it assuming it comes from 2D
+        T = pred_np.shape[0]
+        B = pred_np.shape[1]
+        target_np = np.tile(target_np, (T, 1))
+    
+    T, B = pred_np.shape
+    
+    print(f"Generating {T} confusion matrices in 1x{T} layout...")
+    
+    # Create 1xT subplot figure
+    fig, axes = plt.subplots(1, T, figsize=(4 * T, 3.2))
+    if T == 1:
+        axes = [axes]  # make it iterable if only 1 subplot
+    
+    # Create confusion matrix for each timestep
+    for t in range(T):
+        y_pred_t = pred_np[t, :].reshape(-1)  # [B]
+        y_true_t = target_np[t, :].reshape(-1)  # [B]
+        
+        counts = np.zeros((n_classes, n_classes), dtype=int)
+        for yt, yp in zip(y_true_t, y_pred_t):
+            counts[int(yt), int(yp)] += 1
+        
+        # Convert to proportions per true class (row-normalized)
+        counts_f = counts.astype(float)
+        row_sums = counts_f.sum(axis=1, keepdims=True)
+        row_sums[row_sums == 0] = 1.0
+        props = counts_f / row_sums
+        
+        ax = axes[t]
+        im = ax.imshow(props, interpolation='nearest', cmap=cmap, aspect='equal', vmin=0.0, vmax=1.0)
+        
+        # Add text annotations
+        for r in range(n_classes):
+            for c in range(n_classes):
+                val = props[r, c]
+                txt = f'{val:.2f}' if val > 0 else ''
+                color = 'white' if val < 0.7 else 'gray'
+                ax.text(c, r, txt, ha='center', va='center', color=color, fontsize=8)
+        
+        ax.set_xticks(range(len(labels)))
+        ax.set_xticklabels(labels, rotation=0, fontsize=PLOT_FONT)
+        ax.set_yticks(range(len(labels)))
+        ax.set_yticklabels(labels, fontsize=PLOT_FONT)
+        ax.set_xlabel('Reconstructed', fontsize=PLOT_FONT)
+        if t == 0:
+            ax.set_ylabel('True', fontsize=PLOT_FONT)
+        ax.set_title(f'Timestep {t}', fontsize=PLOT_FONT)
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    
     fig.tight_layout()
+    save_path = os.path.join(SAVE_DIR, 'confusion_matrices.svg')
     fig.savefig(save_path, dpi=200)
     plt.close(fig)
 
@@ -342,7 +390,11 @@ def train(model, X_train, X_test, test_labels, train_labels=None, types=None,
         optimizer.zero_grad()
 
         X_batch = X_train
-        hidden, output = model(X_batch)
+        outs = model(X_batch)
+        if isinstance(outs, tuple) and len(outs) == 3:
+            hidden, latent, output = outs
+        else:
+            hidden, output = outs
 
         ce_loss = F.cross_entropy(
             output.reshape(-1, output.shape[-1]),
@@ -362,7 +414,11 @@ def train(model, X_train, X_test, test_labels, train_labels=None, types=None,
 
         model.eval()
         with torch.no_grad():
-            _, test_output = model(X_test)
+            outs_test = model(X_test)
+            if isinstance(outs_test, tuple) and len(outs_test) == 3:
+                _, _, test_output = outs_test
+            else:
+                _, test_output = outs_test
 
             test_ce_loss = F.cross_entropy(
                 test_output.reshape(-1, test_output.shape[-1]),
@@ -402,8 +458,10 @@ def compute_metrics(train_metrics, test_metrics, latent_test, test_labels, types
 def run_experiment():
     set_seed(seed)
 
-    # use single RNN model for experiments
-    model = RNN(alpha, d_hidden, L, alpha, output_activation='softmax').to(device)
+    # use RNNAutoencoder for experiments (encode -> latent -> reconstruct)
+    model = RNNAutoencoder(d_input=alpha, d_hidden=d_hidden, d_latent_hidden=d_latent_hidden,
+                           num_layers=L, d_latent=d_latent, sequence_length=L,
+                           nonlinearity='linear', device=device).to(device)
 
     seq_train, seq_test, labels_train, labels_test, types = generate_instances(alpha, L, m, frac_train=0.8)
     X_train = sequences_to_tensor(seq_train, alpha).to(device)
@@ -416,12 +474,12 @@ def run_experiment():
 
     
     # confusion matrices
-    # with torch.no_grad():
-    #     _, _, train_output = model(X_train)
-    #     pred_train = torch.argmax(train_output, dim=-1)
-    #     target_train = torch.argmax(X_train, dim=-1)
-    # confusion_matrices(pred_train, target_train, n_classes=alpha, labels=list(string.ascii_lowercase[:alpha]))
-    
+    with torch.no_grad():
+        _, _, test_output = model(X_test)
+        pred_test = torch.argmax(test_output, dim=-1)
+        target_test = torch.argmax(X_test, dim=-1)
+    # confusion_matrices(pred_test, target_test, n_classes=alpha, labels=list(string.ascii_lowercase[:alpha]))
+
     # plotting
     
     # # Euclidean_matrix(model, X_train, seq_train, save_dir=SAVE_DIR, latent_hidden_list=latent_hidden_train_list)
@@ -431,14 +489,25 @@ def run_experiment():
 
     # cosine_similarity(model, X_train, labels_train, types, save_dir=SAVE_DIR)
     # pca_h_t(model, X_train, labels_train, types, seq_train=seq_train, save_dir=SAVE_DIR)
-    pca_trajectory_level(model, X_train, labels_train, types, save_dir=SAVE_DIR)
+    # pca_trajectory_level(model, X_train, labels_train, types, save_dir=SAVE_DIR)
     # pca_hidden_by_timestep(model, X_train, labels_train, types, save_dir=SAVE_DIR)
 
 
     # final evaluation
     model.eval()
     with torch.no_grad():
-        z_test, test_output = model(X_test)
+        # obtain latent hidden sequence (latent RNN hidden) and reconstructed output
+        if hasattr(model, 'encoder') and hasattr(model, 'latent') and hasattr(model, 'decoder'):
+            enc_hidden, enc_latent = model.encoder(X_test)
+            lat_hidden, lat_out = model.latent(enc_latent)
+            z_test = lat_hidden
+            test_output = model.decoder(lat_out)
+        else:
+            outs = model(X_test)
+            if isinstance(outs, tuple) and len(outs) == 3:
+                _, z_test, test_output = outs
+            else:
+                z_test, test_output = outs
         pred_test = torch.argmax(test_output, dim=-1)
         target_test = torch.argmax(X_test, dim=-1)
         test_acc = (pred_test == target_test).all(dim=0).float().mean().item()
@@ -446,6 +515,16 @@ def run_experiment():
     train_acc = history['train_acc'][-1] if len(history['train_acc']) > 0 else 0.0
     train_metrics = {'acc': train_acc}
     test_metrics = {'acc': test_acc}
+
+    idx_to_char = list(string.ascii_lowercase[:alpha])
+    wrong_indices = []
+    print("\nWrong instances on the test set:")
+    for b in range(pred_test.shape[1]):
+        pred_seq = ''.join(idx_to_char[int(i)] for i in pred_test[:, b].tolist())
+        true_seq = seq_test[b]
+        if pred_seq != true_seq:
+            wrong_indices.append(b)
+            print(f"  instance {b}: true={true_seq}, pred={pred_seq}")
 
     compute_metrics(train_metrics, test_metrics, z_test, labels_test, types)
 
