@@ -9,6 +9,8 @@ import string
 import itertools
 from sklearn.decomposition import PCA
 from sklearn.metrics import confusion_matrix
+import plotly.express as px
+import plotly.graph_objects as go
 import copy
 import matplotlib.pyplot as plt
 import os
@@ -20,7 +22,7 @@ L, m, alpha = 4, 2, 6
 epochs = 1000 
 lr = 1e-3
 d_hidden = 64
-d_latent_hidden = 32
+d_latent_hidden = 16
 d_latent = 32
 weight_decay = 1e-3 
 device = torch.device('cpu')
@@ -84,20 +86,29 @@ def sequences_to_tensor(sequences, alpha):
 #                  Representation Geometry
 # -------------------------------------------------------
 
+def _encoder_latent(model, X):
+    _, latent = model.encoder(X)
+    return latent
+
+
+def _sequences_from_tensor(X):
+    token_ids = torch.argmax(X, dim=-1).detach().cpu().numpy().T
+    alphabet = list(string.ascii_lowercase[:X.shape[-1]])
+    return np.array([''.join(alphabet[int(i)] for i in seq) for seq in token_ids])
+
+
+def _hierarchical_token_sort(sequences):
+    sequences = np.asarray(sequences).astype(str)
+    sort_idx = np.array(sorted(
+        range(len(sequences)),
+        key=lambda i: tuple(sequences[i][:depth] for depth in range(1, len(sequences[i]) + 1))
+    ))
+    return sort_idx, sequences[sort_idx]
+
+
 def pca_h_t(model, X_train, labels=None, types=None, seq_train=None, save_dir=SAVE_DIR):
     with torch.no_grad():
-        # Prefer to obtain latent hidden sequence by running encoder then latent RNN
-        if hasattr(model, 'encoder') and hasattr(model, 'latent'):
-            enc_hidden, enc_latent = model.encoder(X_train)
-            lat_hidden, lat_out = model.latent(enc_latent)
-            latent_seq = lat_hidden
-        else:
-            outs = model(X_train)
-            if isinstance(outs, tuple) and len(outs) == 3:
-                # outs[1] may be latent-out or latent-hidden depending on model; use it
-                latent_seq = outs[1]
-            else:
-                latent_seq = outs[0]
+        latent_seq = _encoder_latent(model, X_train)
         h_last = latent_seq[-1].detach().cpu().numpy()
         first_token_ids = torch.argmax(X_train[0], dim=-1).detach().cpu().numpy()
 
@@ -108,10 +119,7 @@ def pca_h_t(model, X_train, labels=None, types=None, seq_train=None, save_dir=SA
     unique_labels = np.unique(labels_np)
     muted_palette = ['#5b8e7d', '#c97c5d', '#6c8ebf', '#b07aa1', '#9e9d57', '#6fa3a3']
     colors = muted_palette
-    if types is not None:
-        token_names = [str(t) for t in types]
-    else:
-        token_names = list(string.ascii_lowercase[:alpha])
+    token_names = [str(t) for t in types]
 
     fig, ax = plt.subplots(figsize=(PLOT_SIZE, PLOT_SIZE))
     for label_idx in unique_labels:
@@ -138,160 +146,49 @@ def pca_h_t(model, X_train, labels=None, types=None, seq_train=None, save_dir=SA
     fig.savefig(os.path.join(save_dir, 'hidden_last_pca.svg'), dpi=200)
     plt.close(fig)
 
-    if h_last.shape[1] >= 3:
-        pca_3d = PCA(n_components=3)
-        h_3d = pca_3d.fit_transform(h_last)
-
-        fig = plt.figure(figsize=(PLOT_SIZE + 1, PLOT_SIZE + 1))
-        ax3d = fig.add_subplot(111, projection='3d')
-        for label_idx in unique_labels:
-            mask = labels_np == label_idx
-            label_name = token_names[int(label_idx)] if int(label_idx) < len(token_names) else f'type {int(label_idx)}'
-            ax3d.scatter(
-                h_3d[mask, 0],
-                h_3d[mask, 1],
-                h_3d[mask, 2],
-                color=colors[int(label_idx) % len(colors)],
-                s=50,
-                label=label_name,
-                alpha=0.85,
-                edgecolors='none',
-            )
-
-        # Add sequence labels to each point
-        if seq_train is not None:
-            seq_array = np.asarray(seq_train)
-            for i in range(h_3d.shape[0]):
-                label_text = seq_array[i] if i < len(seq_array) else f'seq{i}'
-                ax3d.text(h_3d[i, 0], h_3d[i, 1], h_3d[i, 2], label_text, 
-                         fontsize=8, alpha=0.7, ha='center')
-
-        ax3d.set_xlabel(f'PC1 ({pca_3d.explained_variance_ratio_[0] * 100:.1f}%)')
-        ax3d.set_ylabel(f'PC2 ({pca_3d.explained_variance_ratio_[1] * 100:.1f}%)')
-        ax3d.set_zlabel(f'PC3 ({pca_3d.explained_variance_ratio_[2] * 100:.1f}%)')
-        ax3d.legend(fontsize=8, loc='upper right')
-        fig.tight_layout()
-        plt.show()
+   
 
 
-def pca_trajectory_level(model, X, labels, types, save_dir=SAVE_DIR):
-
-    with torch.no_grad():
-        if hasattr(model, 'encoder') and hasattr(model, 'latent'):
-            enc_hidden, enc_latent = model.encoder(X)
-            lat_hidden, lat_out = model.latent(enc_latent)
-            h = lat_hidden.detach().cpu().numpy()
-        else:
-            outs = model(X)
-            if isinstance(outs, tuple) and len(outs) == 3:
-                lat_hidden = outs[1]
-            else:
-                lat_hidden = outs[0]
-            h = lat_hidden.detach().cpu().numpy()  # [T, B, H]
-    T, B, H = h.shape
-
-    # Reshape to [B, T*H] - concatenate timesteps for each sequence
-    h_trajectory = h.transpose(1, 0, 2).reshape(B, T * H)  # [B, T*H]
-
-    # PCA with 3 components
-    pca = PCA(n_components=min(3, h_trajectory.shape[1]))
-    h_3d = pca.fit_transform(h_trajectory)  # [B, 3]
-
-    # Color trajectories by type labels (provided via `labels` argument)
-    token_labels = np.array(labels) if labels is not None else np.argmax(X[1].detach().cpu().numpy(), axis=-1)
-    unique_tokens = np.unique(token_labels)
-
-    fig, ax = plt.subplots(figsize=(PLOT_SIZE, PLOT_SIZE))
-    muted_palette = ['#5b8e7d', '#c97c5d', '#6c8ebf', '#b07aa1', '#9e9d57', '#6fa3a3']
-    colors = muted_palette
-    if types is not None:
-        token_names = [str(t) for t in types]
-    else:
-        token_names = list(string.ascii_lowercase[:alpha])
-    for tok in unique_tokens:
-        mask = token_labels == tok
-        token_name = token_names[int(tok)] if int(tok) < len(token_names) else f'token {int(tok)}'
-        ax.scatter(h_3d[mask, 0], h_3d[mask, 1], color=colors[int(tok) % len(colors)], s=50, label=token_name, alpha=0.8, edgecolors='none')
-
-    ax.set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0] * 100:.1f}%)')
-    ax.set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1] * 100:.1f}%)')
-    ax.grid(True, alpha=0.3)
-    ax.legend(fontsize=8, loc='upper right')
-    ax.set_aspect('equal')
-    ax.set_box_aspect(1)
-
-    fig.tight_layout()
-    fig.savefig(os.path.join(save_dir, 'latent_trajectory_pca.svg'), dpi=200)
-    plt.close(fig)
-
-    # 3D visualization (interactive)
-    if h_3d.shape[1] >= 3:
-        fig = plt.figure(figsize=(PLOT_SIZE + 1, PLOT_SIZE + 1))
-        ax3d = fig.add_subplot(111, projection='3d')
-        for tok in unique_tokens:
-            mask = token_labels == tok
-            token_name = token_names[int(tok)] if int(tok) < len(token_names) else f'token {int(tok)}'
-            ax3d.scatter(h_3d[mask, 0], h_3d[mask, 1], h_3d[mask, 2],
-                        color=colors[int(tok) % len(colors)], s=50, label=token_name,
-                        alpha=0.8, edgecolors='none')
-
-        ax3d.set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0] * 100:.1f}%)')
-        ax3d.set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1] * 100:.1f}%)')
-        ax3d.legend(fontsize=8, loc='upper right')
-        fig.tight_layout()
-        plt.show()
-
-
-def cosine_similarity(model, X_train, labels, types=None, save_dir=SAVE_DIR):
+def cosine_similarity(model, X_train, labels=None, types=None, seq_train=None, save_dir=SAVE_DIR):
  
     with torch.no_grad():
-        if hasattr(model, 'encoder') and hasattr(model, 'latent'):
-            enc_hidden, enc_latent = model.encoder(X_train)
-            lat_hidden, lat_out = model.latent(enc_latent)
-            h_last = lat_hidden[-1].detach().cpu().numpy()
-        else:
-            outs = model(X_train)
-            if isinstance(outs, tuple) and len(outs) == 3:
-                latent = outs[1]
-            else:
-                latent = outs[0]
-            h_last = latent[-1].detach().cpu().numpy()
+        latent = _encoder_latent(model, X_train)
+        h_last = latent[-1].detach().cpu().numpy()
 
-    labels_np = np.asarray(labels)
-       
-    sort_idx = np.argsort(labels_np, kind='stable')
+    sequences = np.asarray(seq_train).astype(str) if seq_train is not None else _sequences_from_tensor(X_train)
+    sort_idx, seq_sorted = _hierarchical_token_sort(sequences)
     h_sorted = h_last[sort_idx]
-    labels_sorted = labels_np[sort_idx]
-    unique_labels = np.unique(labels_sorted)
 
     norms = np.linalg.norm(h_sorted, axis=1, keepdims=True)
     norms = np.maximum(norms, 1e-12)
     cosine_sim = (h_sorted @ h_sorted.T) / (norms @ norms.T)
     cosine_sim = np.clip(cosine_sim, -1.0, 1.0)
 
-    boundaries = []
-    centers = []
-    type_names = []
+    prefix_boundaries = []
+    seq_len = len(seq_sorted[0]) if len(seq_sorted) > 0 else 0
+    for i in range(1, len(seq_sorted)):
+        for depth in range(1, seq_len):
+            if seq_sorted[i - 1][:depth] != seq_sorted[i][:depth]:
+                prefix_boundaries.append((i, depth))
+                break
+
+    first_token_centers = []
+    first_token_names = []
     start = 0
-    for label_idx in unique_labels:
-        count = int(np.sum(labels_sorted == label_idx))
-        end = start + count
-        boundaries.append(end)
-        centers.append((start + end - 1) / 2.0)
-        type_names.append(str(types[int(label_idx)]) if types is not None else f'type {int(label_idx)}')
-        start = end
+    for i in range(1, len(seq_sorted) + 1):
+        at_end = i == len(seq_sorted)
+        if at_end or seq_sorted[i - 1][:1] != seq_sorted[i][:1]:
+            first_token_centers.append((start + i - 1) / 2.0)
+            first_token_names.append(seq_sorted[start][:1])
+            start = i
 
     fig, ax = plt.subplots(figsize=(PLOT_SIZE + 0.75, PLOT_SIZE + 0.75))
     im = ax.imshow(cosine_sim, cmap='viridis', vmin=0, vmax=1.0, interpolation='nearest', aspect='equal')
 
-    for boundary in boundaries[:-1]:
-        ax.axhline(boundary - 0.5, color='white', linewidth=1.0, alpha=0.9)
-        ax.axvline(boundary - 0.5, color='white', linewidth=1.0, alpha=0.9)
-
-    ax.set_xticks(centers)
-    ax.set_yticks(centers)
-    ax.set_xticklabels(type_names, fontsize=8)
-    ax.set_yticklabels(type_names, fontsize=8)
+    ax.set_xticks(first_token_centers)
+    ax.set_yticks(first_token_centers)
+    ax.set_xticklabels(first_token_names, fontsize=8)
+    ax.set_yticklabels(first_token_names, fontsize=8)
 
     fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label='Cosine similarity')
     fig.tight_layout()
@@ -459,7 +356,7 @@ def run_experiment():
     set_seed(seed)
 
     # use RNNAutoencoder for experiments (encode -> latent -> reconstruct)
-    model = RNNAutoencoder(d_input=alpha, d_hidden=d_hidden, d_latent_hidden=d_latent_hidden,
+    model = RNNAutoencoder(d_input=alpha, d_hidden=d_hidden, 
                            num_layers=L, d_latent=d_latent, sequence_length=L,
                            nonlinearity='linear', device=device).to(device)
 
@@ -482,32 +379,18 @@ def run_experiment():
 
     # plotting
     
-    # # Euclidean_matrix(model, X_train, seq_train, save_dir=SAVE_DIR, latent_hidden_list=latent_hidden_train_list)
-    # train_linear_decoders(model, X_train, seq_train, X_test, seq_test, save_dir=SAVE_DIR,
-    #     n_epochs=400, lr=1e-2, latent_hidden_train_list=latent_hidden_train_list,
-    #     latent_hidden_test_list=latent_hidden_test_list)
+    cosine_similarity(model, X_train, labels_train, types, seq_train=seq_train, save_dir=SAVE_DIR)
+    pca_h_t(model, X_train, labels_train, types, seq_train=seq_train, save_dir=SAVE_DIR)
 
-    # cosine_similarity(model, X_train, labels_train, types, save_dir=SAVE_DIR)
-    # pca_h_t(model, X_train, labels_train, types, seq_train=seq_train, save_dir=SAVE_DIR)
-    # pca_trajectory_level(model, X_train, labels_train, types, save_dir=SAVE_DIR)
-    # pca_hidden_by_timestep(model, X_train, labels_train, types, save_dir=SAVE_DIR)
 
 
     # final evaluation
     model.eval()
     with torch.no_grad():
         # obtain latent hidden sequence (latent RNN hidden) and reconstructed output
-        if hasattr(model, 'encoder') and hasattr(model, 'latent') and hasattr(model, 'decoder'):
-            enc_hidden, enc_latent = model.encoder(X_test)
-            lat_hidden, lat_out = model.latent(enc_latent)
-            z_test = lat_hidden
-            test_output = model.decoder(lat_out)
-        else:
-            outs = model(X_test)
-            if isinstance(outs, tuple) and len(outs) == 3:
-                _, z_test, test_output = outs
-            else:
-                z_test, test_output = outs
+        enc_hidden, enc_latent = model.encoder(X_test)
+        z_test = enc_latent
+        test_output = model.decoder(enc_latent)
         pred_test = torch.argmax(test_output, dim=-1)
         target_test = torch.argmax(X_test, dim=-1)
         test_acc = (pred_test == target_test).all(dim=0).float().mean().item()

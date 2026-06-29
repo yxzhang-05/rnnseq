@@ -508,7 +508,7 @@ class RNNDecoder(nn.Module):
         return output
 
 class RNNAutoencoder(nn.Module):
-    def __init__(self, d_input, d_hidden, d_latent_hidden, num_layers, d_latent, sequence_length,
+    def __init__(self, d_input, d_hidden, num_layers, d_latent, sequence_length,
             nonlinearity='linear',
             device="cpu",
             model_filename=None, # file with model parameters
@@ -521,14 +521,14 @@ class RNNAutoencoder(nn.Module):
         self.d_input = d_input
         self.d_hidden = d_hidden
         self.d_latent = d_latent
-        self.d_latent_hidden = d_latent_hidden  
+        # self.d_latent_hidden = d_latent_hidden  
         self.num_layers = num_layers
         self.sequence_length = sequence_length
         self.device = device
 
         self.encoder = RNNEncoder(d_input, d_hidden, num_layers, d_latent, nonlinearity, device,
             model_filename, from_file, to_freeze, init_weights, layer_type)
-        self.latent = RNN(d_latent, d_latent_hidden, num_layers, d_latent, nonlinearity, layer_type=nn.Linear)
+        # self.latent = RNN(d_latent, d_latent_hidden, num_layers, d_latent, nonlinearity, layer_type=nn.Linear)
 
         # Decoder takes d_latent (8-dim) as input from encoder's h2o output
         self.decoder = RNNDecoder(d_latent, d_hidden, num_layers, d_input, nonlinearity, device,
@@ -551,6 +551,5 @@ class RNNAutoencoder(nn.Module):
 
         # hidden is the output sequence, latent = hidden[-1]
         hidden, latent = self.encoder(x, delay=self.delay)
-        _, latent_out = self.latent(latent)
-        reconstructed = self.decoder(latent_out, delay=delay)
-        return hidden, latent_out, reconstructed
+        reconstructed = self.decoder(latent)
+        return hidden, latent, reconstructed
