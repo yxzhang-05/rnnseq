@@ -16,7 +16,7 @@ from analysis_utils import compute_distance
 import sequences
 
 
-seed = 43
+seed = 44
 L, m, alpha = 4, 2, 6
 epochs = 1000 
 lr = 1e-3
@@ -135,30 +135,23 @@ def pca_h_t(model, X_test, labels=None, types=None, seq_train=None, save_dir=SAV
 
 
 # hierachical
-def cosine_similarity(model, X_train, labels=None, types=None, save_dir=SAVE_DIR):
-    with torch.no_grad():
-        hidden, output = model(X_train)
-        hidden = hidden.detach().cpu().numpy()
+def cosine_similarity_multi_seed(models, X_train, labels=None, types=None, save_dir=SAVE_DIR):
+
+    all_cosine = []
 
     token_ids = torch.argmax(X_train, dim=-1).detach().cpu().numpy().T
     alphabet = list(string.ascii_lowercase[:X_train.shape[-1]])
     sequences = np.array([''.join(alphabet[int(i)] for i in seq) for seq in token_ids])
+
     sort_idx = np.array(sorted(range(len(sequences)),
         key=lambda i: tuple(sequences[i][:depth] for depth in range(1, len(sequences[i]) + 1))
     ))
     seq_sorted = sequences[sort_idx]
 
-    prefix_boundaries = []
-    seq_len = len(seq_sorted[0]) if len(seq_sorted) > 0 else 0
-    for i in range(1, len(seq_sorted)):
-        for depth in range(1, seq_len):
-            if seq_sorted[i - 1][:depth] != seq_sorted[i][:depth]:
-                prefix_boundaries.append((i, depth))
-                break
-
     first_token_centers = []
     first_token_names = []
     start = 0
+
     for i in range(1, len(seq_sorted) + 1):
         at_end = i == len(seq_sorted)
         if at_end or seq_sorted[i - 1][:1] != seq_sorted[i][:1]:
@@ -166,32 +159,49 @@ def cosine_similarity(model, X_train, labels=None, types=None, save_dir=SAVE_DIR
             first_token_names.append(seq_sorted[start][:1])
             start = i
 
-    T = hidden.shape[0]
+    for model in models:
+        model.eval()
+
+        with torch.no_grad():
+            hidden, output = model(X_train)
+            hidden = hidden.detach().cpu().numpy()
+
+        T = hidden.shape[0]
+        seed_cosine = []
+
+        for t in range(T):
+            h = hidden[t][sort_idx]
+
+            norms = np.linalg.norm(h, axis=1, keepdims=True)
+            norms = np.maximum(norms, 1e-12)
+
+            cosine_sim = (h @ h.T) / (norms @ norms.T)
+            cosine_sim = np.clip(cosine_sim, -1.0, 1.0)
+
+            seed_cosine.append(cosine_sim)
+
+        all_cosine.append(np.stack(seed_cosine))
+
+    mean_cosine = np.mean(np.stack(all_cosine), axis=0)
+
+    T = mean_cosine.shape[0]
     fig, axes = plt.subplots(1, 4, figsize=(3*T+1, 3))
-    
+
     for t in range(T):
-        h = hidden[t][sort_idx]
-        norms = np.linalg.norm(h, axis=1, keepdims=True)
-        norms = np.maximum(norms, 1e-12)
-        cosine_sim = (h @ h.T) / (norms @ norms.T)
-        cosine_sim = np.clip(cosine_sim, -1.0, 1.0)
+        cosine_sim = mean_cosine[t]
         ax = axes[t]
-        im = ax.imshow(cosine_sim, cmap='viridis', vmin=0,
-            vmax=1.0, interpolation='nearest', aspect='equal')
+
+        im = ax.imshow(cosine_sim, cmap='viridis', vmin=0, vmax=1.0, interpolation='nearest', aspect='equal')
 
         if t == 0:
-            # t=1 和 t=4：只标 a/b/c/d
             tick_pos = first_token_centers
             tick_label = first_token_names
 
         else:
-            # t=2 或 t=3：展开 A 组
             prefix_len = t + 1
-
             tick_pos = []
             tick_label = []
 
-            # A组：按前 prefix_len 个字符分组
             a_idx = np.where(np.char.startswith(seq_sorted, "a"))[0]
             a_seq = seq_sorted[a_idx]
 
@@ -199,23 +209,24 @@ def cosine_similarity(model, X_train, labels=None, types=None, save_dir=SAVE_DIR
             current = a_seq[0][:prefix_len]
 
             for i in range(1, len(a_seq) + 1):
-                at_end = (i == len(a_seq))
+                at_end = i == len(a_seq)
                 if at_end or a_seq[i][:prefix_len] != current:
-                    tick_pos.append((a_idx[start] + a_idx[i - 1]) / 2.0)
+                    tick_pos.append((a_idx[start] + a_idx[i-1]) / 2.0)
                     tick_label.append(current)
+
                     if not at_end:
                         start = i
                         current = a_seq[i][:prefix_len]
-        
+
         ax.set_title(f"$t={t+1}$")
         ax.set_xticks(first_token_centers)
         ax.set_yticks(tick_pos)
         ax.set_xticklabels(first_token_names, fontsize=10)
         ax.set_yticklabels(tick_label, fontsize=10)
 
-    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label='Cosine similarity')
+    fig.colorbar(im, ax=axes, fraction=0.046, pad=0.04, label='Mean cosine similarity')
     fig.tight_layout()
-    fig.savefig(os.path.join(save_dir, 'cosine_similarity.svg'), dpi=200)
+    fig.savefig(os.path.join(save_dir, 'cosine_similarity_10seed_mean.svg'), dpi=200)
     plt.close(fig)
 
 
@@ -351,17 +362,21 @@ def compute_metrics(train_metrics, test_metrics, latent_test, test_labels, types
 
 
 def run_experiment():
-    set_seed(seed)
-
-    # use single RNN model for experiments
-    model = RNN(alpha, d_hidden, L, alpha, output_activation='softmax').to(device)
-
+  
     seq_train, seq_test, labels_train, labels_test, types = generate_instances(alpha, L, m, frac_train=0.8)
     X_train = sequences_to_tensor(seq_train, alpha).to(device)
     X_test = sequences_to_tensor(seq_test, alpha).to(device)
 
-    history = train(model, X_train, X_test, n_epochs=epochs, lr=lr, weight_decay=weight_decay)
+    seeds = [12, 37, 58, 103, 256, 421, 777, 1024, 2048, 4096]
 
+    models = []
+    
+    for seed in seeds:
+        set_seed(seed)
+        model = RNN(alpha, d_hidden, L, alpha, output_activation='softmax').to(device)
+        models.append(model)
+        history = train(model, X_train, X_test, n_epochs=epochs, lr=lr, weight_decay=weight_decay)
+    models.append(model)
     
     # confusion matrices
     # with torch.no_grad():
@@ -371,7 +386,7 @@ def run_experiment():
     # confusion_matrices(pred_train, target_train, n_classes=alpha, labels=list(string.ascii_lowercase[:alpha]))
     
     # plotting
-    cosine_similarity(model, X_test, labels_test, types, save_dir=SAVE_DIR)
+    cosine_similarity_multi_seed(models, X_test, labels_test, types, save_dir=SAVE_DIR)
     # pca_h_t(model, X_test, labels_test, types, seq_train=seq_train, save_dir=SAVE_DIR)
 
 

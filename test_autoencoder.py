@@ -150,24 +150,31 @@ def pca_h_t(model, X_train, seq_train, save_dir=SAVE_DIR):
     fig.write_html(os.path.join(save_dir, "hidden_pca_b_3d.html"), include_plotlyjs=True)
 
    
-def cosine_similarity_multi_seed(models, X_train, save_dir=SAVE_DIR):
+def cosine_similarity(model, X_train, seq_train=None, save_dir=SAVE_DIR):
 
-    all_cosine = []
+    with torch.no_grad():
+        hidden, latent = model.encoder(X_train)
+        enc_hidden = hidden.detach().cpu().numpy()      # (L,B,d)
 
     token_ids = torch.argmax(X_train, dim=-1).detach().cpu().numpy().T
     alphabet = list(string.ascii_lowercase[:X_train.shape[-1]])
     sequences = np.array([''.join(alphabet[int(i)] for i in seq) for seq in token_ids])
-
     sort_idx = np.array(sorted(range(len(sequences)),
         key=lambda i: tuple(sequences[i][:depth] for depth in range(1, len(sequences[i]) + 1))
     ))
-
     seq_sorted = sequences[sort_idx]
+
+    prefix_boundaries = []
+    seq_len = len(seq_sorted[0]) if len(seq_sorted) > 0 else 0
+    for i in range(1, len(seq_sorted)):
+        for depth in range(1, seq_len):
+            if seq_sorted[i - 1][:depth] != seq_sorted[i][:depth]:
+                prefix_boundaries.append((i, depth))
+                break
 
     first_token_centers = []
     first_token_names = []
     start = 0
-
     for i in range(1, len(seq_sorted) + 1):
         at_end = i == len(seq_sorted)
         if at_end or seq_sorted[i - 1][:1] != seq_sorted[i][:1]:
@@ -175,64 +182,110 @@ def cosine_similarity_multi_seed(models, X_train, save_dir=SAVE_DIR):
             first_token_names.append(seq_sorted[start][:1])
             start = i
 
-    for model in models:
-        model.eval()
-
-        with torch.no_grad():
-            hidden, latent = model.encoder(X_train)
-            enc_hidden = hidden.detach().cpu().numpy()
-
-        T = enc_hidden.shape[0]
-        seed_cosine = []
-
-        for t in range(T):
-            h = enc_hidden[t][sort_idx]
-
-            norms = np.linalg.norm(h, axis=1, keepdims=True)
-            norms = np.maximum(norms, 1e-12)
-
-            cosine_sim = (h @ h.T) / (norms @ norms.T)
-            cosine_sim = np.clip(cosine_sim, -1.0, 1.0)
-
-            seed_cosine.append(cosine_sim)
-
-        all_cosine.append(np.stack(seed_cosine))
-
-    mean_cosine = np.mean(np.stack(all_cosine), axis=0)
-
-    T = mean_cosine.shape[0]
-
-    fig, axes = plt.subplots(1, T, figsize=(3*T+1, 3))
-
-    if T == 1:
-        axes = [axes]
-
+    T = enc_hidden.shape[0]
+    fig, axes = plt.subplots(1, 4, figsize=(3*T+1, 3))
+    
     for t in range(T):
+        h = enc_hidden[t][sort_idx]
+        norms = np.linalg.norm(h, axis=1, keepdims=True)
+        norms = np.maximum(norms, 1e-12)
+        cosine_sim = (h @ h.T) / (norms @ norms.T)
+        cosine_sim = np.clip(cosine_sim, -1.0, 1.0)
         ax = axes[t]
+        im = ax.imshow(cosine_sim, cmap='viridis', vmin=0,
+            vmax=1.0, interpolation='nearest', aspect='equal')
 
-        im = ax.imshow(
-            mean_cosine[t],
-            cmap='viridis',
-            vmin=0,
-            vmax=1,
-            interpolation='nearest',
-            aspect='equal'
-        )
-
+        tick_pos = first_token_centers
+        tick_label = first_token_names
+        
         ax.set_title(f"$t={t+1}$")
-
         ax.set_xticks(first_token_centers)
-        ax.set_yticks(first_token_centers)
-
+        ax.set_yticks(tick_pos)
         ax.set_xticklabels(first_token_names, fontsize=10)
-        ax.set_yticklabels(first_token_names, fontsize=10)
+        ax.set_yticklabels(tick_label, fontsize=10)
 
-    fig.colorbar(im, ax=axes, fraction=0.046, pad=0.04, label='Mean cosine similarity')
-
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label='Cosine similarity')
     fig.tight_layout()
+    fig.savefig(os.path.join(save_dir, 'cosine_similarity_auto.svg'), dpi=200)
+    plt.close(fig)
 
-    fig.savefig(os.path.join(save_dir, 'cosine_similarity_10seed_mean.svg'), dpi=200)
 
+def confusion_matrices(pred, target, n_classes=None, labels=None, cmap='cividis'):
+
+    # convert to numpy (ensure ints)
+    if hasattr(pred, 'cpu'):
+        pred_np = pred.detach().cpu().numpy()
+    else:
+        pred_np = np.array(pred)
+    if hasattr(target, 'cpu'):
+        target_np = target.detach().cpu().numpy()
+    else:
+        target_np = np.array(target)
+
+    pred_np = pred_np.astype(int)
+    target_np = target_np.astype(int)
+
+    labels = list(labels) if labels is not None else list(range(n_classes))
+    
+    # Handle 3D case: [T, B, C] -> [T, B]
+    if pred_np.ndim == 3:
+        pred_np = np.argmax(pred_np, axis=-1)
+    
+    # Ensure target is 2D [T, B]
+    if target_np.ndim == 1:
+        # If target is 1D, reshape it assuming it comes from 2D
+        T = pred_np.shape[0]
+        B = pred_np.shape[1]
+        target_np = np.tile(target_np, (T, 1))
+    
+    T, B = pred_np.shape
+    
+    print(f"Generating {T} confusion matrices in 1x{T} layout...")
+    
+    # Create 1xT subplot figure
+    fig, axes = plt.subplots(1, T, figsize=(4 * T, 3.2))
+    if T == 1:
+        axes = [axes]  # make it iterable if only 1 subplot
+    
+    # Create confusion matrix for each timestep
+    for t in range(T):
+        y_pred_t = pred_np[t, :].reshape(-1)  # [B]
+        y_true_t = target_np[t, :].reshape(-1)  # [B]
+        
+        counts = np.zeros((n_classes, n_classes), dtype=int)
+        for yt, yp in zip(y_true_t, y_pred_t):
+            counts[int(yt), int(yp)] += 1
+        
+        # Convert to proportions per true class (row-normalized)
+        counts_f = counts.astype(float)
+        row_sums = counts_f.sum(axis=1, keepdims=True)
+        row_sums[row_sums == 0] = 1.0
+        props = counts_f / row_sums
+        
+        ax = axes[t]
+        im = ax.imshow(props, interpolation='nearest', cmap=cmap, aspect='equal', vmin=0.0, vmax=1.0)
+        
+        # Add text annotations
+        for r in range(n_classes):
+            for c in range(n_classes):
+                val = props[r, c]
+                txt = f'{val:.2f}' if val > 0 else ''
+                color = 'white' if val < 0.7 else 'gray'
+                ax.text(c, r, txt, ha='center', va='center', color=color, fontsize=8)
+        
+        ax.set_xticks(range(len(labels)))
+        ax.set_xticklabels(labels, rotation=0, fontsize=PLOT_FONT)
+        ax.set_yticks(range(len(labels)))
+        ax.set_yticklabels(labels, fontsize=PLOT_FONT)
+        ax.set_xlabel('Reconstructed', fontsize=PLOT_FONT)
+        if t == 0:
+            ax.set_ylabel('True', fontsize=PLOT_FONT)
+        ax.set_title(f'Timestep {t}', fontsize=PLOT_FONT)
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    
+    fig.tight_layout()
+    save_path = os.path.join(SAVE_DIR, 'confusion_matrices.svg')
+    fig.savefig(save_path, dpi=200)
     plt.close(fig)
 
 
@@ -371,38 +424,30 @@ def scan_hidden_latent():
 
 
 def run_experiment():
+    set_seed(seed)
+
+    # use RNNAutoencoder for experiments (encode -> latent -> reconstruct)
+    model = RNNAutoencoder(d_input=alpha, d_hidden=d_hidden, 
+                           num_layers=L, d_latent=d_latent, sequence_length=L,
+                           nonlinearity='linear', device=device).to(device)
 
     seq_train, seq_test, labels_train, labels_test, types = generate_instances(alpha, L, m, frac_train=0.8)
     X_train = sequences_to_tensor(seq_train, alpha).to(device)
     X_test = sequences_to_tensor(seq_test, alpha).to(device)
-    test_labels = torch.tensor(labels_test, dtype=torch.long)
-    train_labels = torch.tensor(labels_train, dtype=torch.long)
 
-    models = []
-    seeds = [12, 37, 58, 103, 256, 421, 777, 1024, 2048, 4096]
-    for seed in seeds:
+    history = train(model, X_train, X_test, labels_test, labels_train, types=types,
+        n_epochs=epochs, lr=lr, weight_decay=weight_decay)
 
-        set_seed(seed)
-        set_seed(seed)
-
-        # use RNNAutoencoder for experiments (encode -> latent -> reconstruct)
-        model = RNNAutoencoder(d_input=alpha, d_hidden=d_hidden, 
-                            num_layers=L, d_latent=d_latent, sequence_length=L,
-                            nonlinearity='linear', device=device).to(device)
-        history = train(model, X_train, X_test, test_labels, train_labels=train_labels, types=types,
-            n_epochs=epochs, lr=lr, weight_decay=weight_decay)
-        
-        models.append(model)
     
-    # # confusion matrices
-    # with torch.no_grad():
-    #     _, _, test_output = model(X_test)
-    #     pred_test = torch.argmax(test_output, dim=-1)
-    #     target_test = torch.argmax(X_test, dim=-1)
+    # confusion matrices
+    with torch.no_grad():
+        _, _, test_output = model(X_test)
+        pred_test = torch.argmax(test_output, dim=-1)
+        target_test = torch.argmax(X_test, dim=-1)
     # confusion_matrices(pred_test, target_test, n_classes=alpha, labels=list(string.ascii_lowercase[:alpha]))
 
     # plotting
-    cosine_similarity_multi_seed(models, X_train, save_dir=SAVE_DIR)
+    cosine_similarity(model, X_train, seq_train=seq_train, save_dir=SAVE_DIR)
     # pca_h_t(model, X_test, seq_test, save_dir=SAVE_DIR)
 
 
