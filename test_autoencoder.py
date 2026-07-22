@@ -1,0 +1,438 @@
+import random
+import numpy as np
+import torch
+import torch.nn.functional as F
+import pandas as pd
+from model import RNN, RNNAutoencoder
+from sequences import findStructures, replace_symbols as seq_replace_symbols
+import string
+import itertools
+from sklearn.decomposition import PCA
+from sklearn.metrics import confusion_matrix
+import plotly.express as px
+import plotly.graph_objects as go
+import copy
+import matplotlib.pyplot as plt
+import os
+from analysis_utils import compute_distance
+
+
+seed = 45
+L, m, alpha = 4, 2, 6
+epochs = 1000 
+lr = 1e-3
+d_hidden = 32
+d_latent = 16
+weight_decay = 1e-3 
+device = torch.device('cpu')
+SAVE_DIR = "results"
+PLOT_SIZE = 3
+PLOT_FONT = 13
+plt.rcParams.update({'font.size': PLOT_FONT})
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+def generate_instances(alpha, L, m, frac_train=0.8):
+    alphabet = list(string.ascii_lowercase[:alpha])
+    types = sum(findStructures(alphabet, L, m), [])  # flatten
+    all_perms = list(itertools.permutations(alphabet, m))
+
+    train_seqs, test_seqs = [], []
+    train_labels, test_labels = [], []
+
+    for type_idx in range(len(types)):
+        t = types[type_idx]
+        all_type_seqs = [seq_replace_symbols(t, perm) for perm in all_perms]
+
+        n = len(all_type_seqs)
+        split = int(frac_train * n)
+        perm_idx = np.random.permutation(n)
+        train_idx = perm_idx[:split]
+        test_idx = perm_idx[split:]
+
+        train_type_seqs = [all_type_seqs[i] for i in train_idx]
+        test_type_seqs = [all_type_seqs[i] for i in test_idx]
+
+        train_seqs.extend(train_type_seqs)
+        test_seqs.extend(test_type_seqs)
+        train_labels.extend([type_idx] * len(train_type_seqs))
+        test_labels.extend([type_idx] * len(test_type_seqs))
+
+    return (np.array(train_seqs), np.array(test_seqs), np.array(train_labels), np.array(test_labels), types)
+
+
+def sequences_to_tensor(sequences, alpha):
+    letter_to_idx = {l: i for i, l in enumerate(string.ascii_lowercase[:alpha])}
+    one_hot = []
+    for seq in sequences:
+        seq_onehot = []
+        for c in seq:
+            vec = [0] * alpha
+            vec[letter_to_idx[c]] = 1
+            seq_onehot.append(vec)
+        one_hot.append(seq_onehot)
+    one_hot = torch.tensor(one_hot, dtype=torch.float)
+    return one_hot.permute(1, 0, 2)
+
+
+# -------------------------------------------------------
+#                  Representation Geometry
+# -------------------------------------------------------
+
+def pca_h_t(model, X_train, seq_train, save_dir=SAVE_DIR):
+
+    with torch.no_grad():
+        hidden, latent = model.encoder(X_train)
+        enc_hidden = hidden.detach().cpu().numpy()
+
+    L, N, H = enc_hidden.shape
+
+    hidden_flat = enc_hidden.reshape(L * N, H)
+    pca = PCA(n_components=3)
+    coords_all = pca.fit_transform(hidden_flat)
+    coords_all = coords_all.reshape(L, N, 3)
+
+    sequences = np.asarray(seq_train)
+    idx = [i for i, seq in enumerate(sequences) if seq.startswith("b")]
+
+    coords = coords_all[:, idx, :]
+    sequences = sequences[idx]
+
+    fig = go.Figure()
+
+    colors = plt.cm.tab20(np.linspace(0, 1, len(idx)))
+
+    for seq_idx, seq in enumerate(sequences):
+        color = f"rgb({int(colors[seq_idx][0]*255)}, {int(colors[seq_idx][1]*255)}, {int(colors[seq_idx][2]*255)})"
+
+        # trajectory
+        fig.add_trace(go.Scatter3d(
+            x=coords[:, seq_idx, 0],
+            y=coords[:, seq_idx, 1],
+            z=coords[:, seq_idx, 2],
+            mode="lines",
+            line=dict(color=color, width=2),
+            name=seq,
+            showlegend=False
+        ))
+
+        # prefix labels
+        for t in range(L):
+            prefix = seq[:t+1]
+
+            fig.add_trace(go.Scatter3d(
+                x=[coords[t, seq_idx, 0]],
+                y=[coords[t, seq_idx, 1]],
+                z=[coords[t, seq_idx, 2]],
+                mode="text",
+                text=[prefix],
+                textfont=dict(size=12, color=color),
+                showlegend=False
+            ))
+
+    fig.update_layout(
+        width=700,
+        height=700,
+        scene=dict(
+            xaxis_title=f"PC1 ({pca.explained_variance_ratio_[0]*100:.1f}%)",
+            yaxis_title=f"PC2 ({pca.explained_variance_ratio_[1]*100:.1f}%)",
+            zaxis_title=f"PC3 ({pca.explained_variance_ratio_[2]*100:.1f}%)",
+            aspectmode="cube"
+        ),
+        margin=dict(l=0, r=0, b=0, t=30)
+    )
+    fig.write_html(os.path.join(save_dir, "hidden_pca_b_3d.html"), include_plotlyjs=True)
+
+   
+def cosine_similarity_multi_seed(models, X_train, save_dir=SAVE_DIR):
+
+    all_cosine = []
+
+    token_ids = torch.argmax(X_train, dim=-1).detach().cpu().numpy().T
+    alphabet = list(string.ascii_lowercase[:X_train.shape[-1]])
+    sequences = np.array([''.join(alphabet[int(i)] for i in seq) for seq in token_ids])
+
+    sort_idx = np.array(sorted(range(len(sequences)),
+        key=lambda i: tuple(sequences[i][:depth] for depth in range(1, len(sequences[i]) + 1))
+    ))
+
+    seq_sorted = sequences[sort_idx]
+
+    first_token_centers = []
+    first_token_names = []
+    start = 0
+
+    for i in range(1, len(seq_sorted) + 1):
+        at_end = i == len(seq_sorted)
+        if at_end or seq_sorted[i - 1][:1] != seq_sorted[i][:1]:
+            first_token_centers.append((start + i - 1) / 2.0)
+            first_token_names.append(seq_sorted[start][:1])
+            start = i
+
+    for model in models:
+        model.eval()
+
+        with torch.no_grad():
+            hidden, latent = model.encoder(X_train)
+            enc_hidden = hidden.detach().cpu().numpy()
+
+        T = enc_hidden.shape[0]
+        seed_cosine = []
+
+        for t in range(T):
+            h = enc_hidden[t][sort_idx]
+
+            norms = np.linalg.norm(h, axis=1, keepdims=True)
+            norms = np.maximum(norms, 1e-12)
+
+            cosine_sim = (h @ h.T) / (norms @ norms.T)
+            cosine_sim = np.clip(cosine_sim, -1.0, 1.0)
+
+            seed_cosine.append(cosine_sim)
+
+        all_cosine.append(np.stack(seed_cosine))
+
+    mean_cosine = np.mean(np.stack(all_cosine), axis=0)
+
+    T = mean_cosine.shape[0]
+
+    fig, axes = plt.subplots(1, T, figsize=(3*T+1, 3))
+
+    if T == 1:
+        axes = [axes]
+
+    for t in range(T):
+        ax = axes[t]
+
+        im = ax.imshow(
+            mean_cosine[t],
+            cmap='viridis',
+            vmin=0,
+            vmax=1,
+            interpolation='nearest',
+            aspect='equal'
+        )
+
+        ax.set_title(f"$t={t+1}$")
+
+        ax.set_xticks(first_token_centers)
+        ax.set_yticks(first_token_centers)
+
+        ax.set_xticklabels(first_token_names, fontsize=10)
+        ax.set_yticklabels(first_token_names, fontsize=10)
+
+    fig.colorbar(im, ax=axes, fraction=0.046, pad=0.04, label='Mean cosine similarity')
+
+    fig.tight_layout()
+
+    fig.savefig(os.path.join(save_dir, 'cosine_similarity_10seed_mean.svg'), dpi=200)
+
+    plt.close(fig)
+
+
+
+def train(model, X_train, X_test, test_labels, train_labels=None, types=None,
+    n_epochs=300, lr=0.001, weight_decay=1e-3, print_final=True):
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+    history = {k: [] for k in ['train_loss', 'test_loss', 'train_acc', 'test_acc']}
+ 
+    for epoch in range(n_epochs):
+        model.train()
+        optimizer.zero_grad()
+
+        X_batch = X_train
+        outs = model(X_batch)
+        hidden, latent, output = outs
+
+        ce_loss = F.cross_entropy(
+            output.reshape(-1, output.shape[-1]),
+            torch.argmax(X_batch, dim=-1).reshape(-1)
+        )
+        total_loss = ce_loss
+
+        total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+
+        # evaluation
+        with torch.no_grad():
+            pred_train = torch.argmax(output, dim=-1)
+            target_train = torch.argmax(X_batch, dim=-1)
+            train_acc = (pred_train == target_train).all(dim=0).float().mean().item()
+
+        model.eval()
+        with torch.no_grad():
+            outs_test = model(X_test)
+            if isinstance(outs_test, tuple) and len(outs_test) == 3:
+                _, _, test_output = outs_test
+            else:
+                _, test_output = outs_test
+
+            test_ce_loss = F.cross_entropy(
+                test_output.reshape(-1, test_output.shape[-1]),
+                torch.argmax(X_test, dim=-1).reshape(-1)
+            )
+            test_loss = test_ce_loss
+
+            pred_test = torch.argmax(test_output, dim=-1)
+            target_test = torch.argmax(X_test, dim=-1)
+            test_acc = (pred_test == target_test).all(dim=0).float().mean().item()
+
+        # history - only save final epoch values to reduce memory
+        if epoch == n_epochs - 1:
+            history['train_loss'].append(total_loss.item())
+            history['test_loss'].append(float(test_loss))
+            history['train_acc'].append(train_acc)
+            history['test_acc'].append(test_acc)
+
+        
+        # Print at the final epoch when enabled.
+        if print_final and epoch == n_epochs - 1:
+            print(f"\nEpoch {epoch+1}/{n_epochs}:")
+            print(f"  Train - Loss: {total_loss.item():.4f}, Acc: {train_acc:.4f}")
+            print(f"  Test  - Loss: {test_loss.item():.4f}, Acc: {test_acc:.4f}")
+
+    return history
+
+
+def compute_metrics(train_metrics, test_metrics, latent_test, test_labels, types):
+    print('\n' + '='*60)
+    print('='*60)
+    print(f"Train acc: {train_metrics['acc']:.4f}")
+    print(f"Test acc: {test_metrics['acc']:.4f}")
+
+
+def scan_hidden_latent():
+    hidden_list = [4, 8, 16, 32, 64, 128]
+    latent_list = [2, 4, 8, 16, 32, 64, 128]
+    repeats = 10
+
+    os.makedirs(SAVE_DIR, exist_ok=True)
+
+    seq_train, seq_test, labels_train, labels_test, types = generate_instances(alpha, L, m, frac_train=0.8)
+    X_train = sequences_to_tensor(seq_train, alpha).to(device)
+    X_test = sequences_to_tensor(seq_test, alpha).to(device)
+    train_labels = torch.tensor(labels_train, dtype=torch.long)
+    test_labels = torch.tensor(labels_test, dtype=torch.long)
+
+    results = []
+
+    for d_hidden in hidden_list:
+        for d_latent in latent_list:
+            for r in range(repeats):
+
+                print(f"d_hidden={d_hidden}, d_latent={d_latent}, run={r+1}/{repeats}")
+                set_seed(seed + r*10)
+
+                model = RNNAutoencoder(d_input=alpha, d_hidden=d_hidden, num_layers=L, d_latent=d_latent, 
+                                       sequence_length=L, nonlinearity='linear', device=device).to(device)
+                train(model, X_train, X_test, test_labels, train_labels=train_labels, types=types, 
+                      n_epochs=epochs, lr=lr, weight_decay=weight_decay, print_final=False)
+
+                model.eval()
+                with torch.no_grad():
+                    _, latent = model.encoder(X_test)
+                    output = model.decoder(latent)
+                    pred = torch.argmax(output, dim=-1)
+                    target = torch.argmax(X_test, dim=-1)
+                    acc = (pred == target).all(dim=0).float().mean().item()
+
+                results.append([d_hidden, d_latent, r, acc])
+
+    df = pd.DataFrame(results, columns=["d_hidden", "d_latent", "run", "acc"])
+    df.to_csv(os.path.join(SAVE_DIR, "hidden_latent_scan.csv"), index=False)
+
+    heatmap = df.groupby(["d_hidden", "d_latent"])["acc"].mean().reset_index()
+    heatmap = heatmap.pivot(index="d_hidden", columns="d_latent", values="acc")
+
+    plt.figure(figsize=(4, 4))
+    plt.imshow(heatmap.values, origin="lower", cmap="viridis", vmin=0, vmax=1, aspect="auto")
+    plt.xticks(range(len(latent_list)), latent_list)
+    plt.yticks(range(len(hidden_list)), hidden_list)
+    plt.xlabel("Latent dimension")
+    plt.ylabel("Hidden dimension")
+    plt.colorbar(label="Mean accuracy")
+
+    for i in range(len(hidden_list)):
+        for j in range(len(latent_list)):
+            value = heatmap.values[i, j]
+            plt.text(j, i, f"{value:.2f}", ha="center", va="center", fontsize=10, color="white" if value < 0.5 else "black")
+    plt.tight_layout()
+    plt.savefig(os.path.join(SAVE_DIR, "hidden_latent_heatmap.svg"), dpi=300)
+    plt.close()
+
+
+
+def run_experiment():
+
+    seq_train, seq_test, labels_train, labels_test, types = generate_instances(alpha, L, m, frac_train=0.8)
+    X_train = sequences_to_tensor(seq_train, alpha).to(device)
+    X_test = sequences_to_tensor(seq_test, alpha).to(device)
+    test_labels = torch.tensor(labels_test, dtype=torch.long)
+    train_labels = torch.tensor(labels_train, dtype=torch.long)
+
+    models = []
+    seeds = [12, 37, 58, 103, 256, 421, 777, 1024, 2048, 4096]
+    for seed in seeds:
+
+        set_seed(seed)
+        set_seed(seed)
+
+        # use RNNAutoencoder for experiments (encode -> latent -> reconstruct)
+        model = RNNAutoencoder(d_input=alpha, d_hidden=d_hidden, 
+                            num_layers=L, d_latent=d_latent, sequence_length=L,
+                            nonlinearity='linear', device=device).to(device)
+        history = train(model, X_train, X_test, test_labels, train_labels=train_labels, types=types,
+            n_epochs=epochs, lr=lr, weight_decay=weight_decay)
+        
+        models.append(model)
+    
+    # # confusion matrices
+    # with torch.no_grad():
+    #     _, _, test_output = model(X_test)
+    #     pred_test = torch.argmax(test_output, dim=-1)
+    #     target_test = torch.argmax(X_test, dim=-1)
+    # confusion_matrices(pred_test, target_test, n_classes=alpha, labels=list(string.ascii_lowercase[:alpha]))
+
+    # plotting
+    cosine_similarity_multi_seed(models, X_train, save_dir=SAVE_DIR)
+    # pca_h_t(model, X_test, seq_test, save_dir=SAVE_DIR)
+
+
+
+    # final evaluation
+    model.eval()
+    with torch.no_grad():
+        # obtain latent hidden sequence (latent RNN hidden) and reconstructed output
+        enc_hidden, enc_latent = model.encoder(X_test)
+        z_test = enc_latent
+        test_output = model.decoder(enc_latent)
+        pred_test = torch.argmax(test_output, dim=-1)
+        target_test = torch.argmax(X_test, dim=-1)
+        test_acc = (pred_test == target_test).all(dim=0).float().mean().item()
+
+    train_acc = history['train_acc'][-1] if len(history['train_acc']) > 0 else 0.0
+    train_metrics = {'acc': train_acc}
+    test_metrics = {'acc': test_acc}
+
+    idx_to_char = list(string.ascii_lowercase[:alpha])
+    wrong_indices = []
+    print("\nWrong instances on the test set:")
+    for b in range(pred_test.shape[1]):
+        pred_seq = ''.join(idx_to_char[int(i)] for i in pred_test[:, b].tolist())
+        true_seq = seq_test[b]
+        if pred_seq != true_seq:
+            wrong_indices.append(b)
+            print(f"  instance {b}: true={true_seq}, pred={pred_seq}")
+
+    compute_metrics(train_metrics, test_metrics, z_test, labels_test, types)
+
+if __name__ == '__main__':
+    run_experiment()

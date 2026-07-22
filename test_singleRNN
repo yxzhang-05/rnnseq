@@ -1,0 +1,393 @@
+import random
+import numpy as np
+import torch
+import torch.nn.functional as F
+import pandas as pd
+from model import RNN
+from sequences import findStructures, replace_symbols as seq_replace_symbols
+import string
+import itertools
+from sklearn.decomposition import PCA
+from sklearn.metrics import confusion_matrix
+import plotly.graph_objects as go
+import matplotlib.pyplot as plt
+import os
+from analysis_utils import compute_distance
+import sequences
+
+
+seed = 43
+L, m, alpha = 4, 2, 6
+epochs = 1000 
+lr = 1e-3
+d_hidden = 32
+weight_decay = 1e-3 
+device = torch.device('cpu')
+SAVE_DIR = "results"
+PLOT_SIZE = 3
+PLOT_FONT = 13
+plt.rcParams.update({'font.size': PLOT_FONT})
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+def generate_instances(alpha, L, m, frac_train=0.8):
+    alphabet = list(string.ascii_lowercase[:alpha])
+    types = sum(findStructures(alphabet, L, m), [])  # flatten
+    all_perms = list(itertools.permutations(alphabet, m))
+
+    train_seqs, test_seqs = [], []
+    train_labels, test_labels = [], []
+
+    for type_idx in range(len(types)):
+        t = types[type_idx]
+        all_type_seqs = [seq_replace_symbols(t, perm) for perm in all_perms]
+
+        n = len(all_type_seqs)
+        split = int(frac_train * n)
+        perm_idx = np.random.permutation(n)
+        train_idx = perm_idx[:split]
+        test_idx = perm_idx[split:]
+
+        train_type_seqs = [all_type_seqs[i] for i in train_idx]
+        test_type_seqs = [all_type_seqs[i] for i in test_idx]
+
+        train_seqs.extend(train_type_seqs)
+        test_seqs.extend(test_type_seqs)
+        train_labels.extend([type_idx] * len(train_type_seqs))
+        test_labels.extend([type_idx] * len(test_type_seqs))
+
+    return (np.array(train_seqs), np.array(test_seqs), np.array(train_labels), np.array(test_labels), types)
+
+
+def sequences_to_tensor(sequences, alpha):
+    letter_to_idx = {l: i for i, l in enumerate(string.ascii_lowercase[:alpha])}
+    one_hot = []
+    for seq in sequences:
+        seq_onehot = []
+        for c in seq:
+            vec = [0] * alpha
+            vec[letter_to_idx[c]] = 1
+            seq_onehot.append(vec)
+        one_hot.append(seq_onehot)
+    one_hot = torch.tensor(one_hot, dtype=torch.float)
+    return one_hot.permute(1, 0, 2)
+
+
+# -------------------------------------------------------
+#                  Representation Geometry
+# -------------------------------------------------------
+
+def _sequences_from_tensor(X):
+    token_ids = torch.argmax(X, dim=-1).detach().cpu().numpy().T
+    alphabet = list(string.ascii_lowercase[:X.shape[-1]])
+    return np.array([''.join(alphabet[int(i)] for i in seq) for seq in token_ids])
+
+    
+def pca_h_t(model, X_test, labels=None, types=None, seq_train=None, save_dir=SAVE_DIR):
+    with torch.no_grad():
+        hidden, _ = model(X_test)
+
+    os.makedirs(save_dir, exist_ok=True)
+
+    hidden = hidden.detach().cpu().numpy()      # (L, N, H)
+    L, N, H = hidden.shape
+
+    hidden_flat = hidden.reshape(L * N, H)
+    pca = PCA(n_components=2)
+    coords = pca.fit_transform(hidden_flat)
+    coords = coords.reshape(L, N, 2)
+
+    cmap = plt.get_cmap("tab20", N)
+    alphas = np.linspace(0.2, 1.0, L)
+
+    # plt.figure(figsize=(4, 4))
+
+    # for seq_idx in range(N):
+    #     color = cmap(seq_idx)
+    #     for t in range(L):
+    #         plt.scatter(coords[t, seq_idx, 0], coords[t, seq_idx, 1], color=color, alpha=alphas[t], s=30)
+    #         plt.plot(coords[:, seq_idx, 0], coords[:, seq_idx, 1], color=color, linewidth=1, alpha=0.5)
+   
+    # plt.xlabel(f"PC1 ({pca.explained_variance_ratio_[0] * 100:.1f}%)")
+    # plt.ylabel(f"PC2 ({pca.explained_variance_ratio_[1] * 100:.1f}%)")
+    # plt.tight_layout()
+    # plt.savefig(os.path.join(save_dir, "hidden_pca_all.svg"), dpi=300)
+    # plt.close()
+
+    sequences = _sequences_from_tensor(X_test)
+    idx = [i for i, seq in enumerate(sequences) if seq.startswith("a")]
+    plt.figure(figsize=(3.5,3.5))
+    plt.scatter(coords[:, idx, 0], coords[:, idx, 1], s=1, alpha=0)
+    for i in idx:
+        color = cmap.colors[::2]
+        for t in range(L):
+            prefix = sequences[i][:t+1]
+            plt.text(coords[t, i, 0], coords[t, i, 1], prefix, color=color[i % len(color)], ha="center", va="center", fontsize=10)
+    plt.xlabel(f"PC1 ({pca.explained_variance_ratio_[0] * 100:.1f}%)")
+    plt.ylabel(f"PC2 ({pca.explained_variance_ratio_[1] * 100:.1f}%)")
+    plt.savefig(os.path.join(save_dir, "hidden_pca_a.svg"), dpi=300, bbox_inches="tight")
+
+
+# hierachical
+def cosine_similarity(model, X_train, labels=None, types=None, save_dir=SAVE_DIR):
+    with torch.no_grad():
+        hidden, output = model(X_train)
+        hidden = hidden.detach().cpu().numpy()
+
+    token_ids = torch.argmax(X_train, dim=-1).detach().cpu().numpy().T
+    alphabet = list(string.ascii_lowercase[:X_train.shape[-1]])
+    sequences = np.array([''.join(alphabet[int(i)] for i in seq) for seq in token_ids])
+    sort_idx = np.array(sorted(range(len(sequences)),
+        key=lambda i: tuple(sequences[i][:depth] for depth in range(1, len(sequences[i]) + 1))
+    ))
+    seq_sorted = sequences[sort_idx]
+
+    prefix_boundaries = []
+    seq_len = len(seq_sorted[0]) if len(seq_sorted) > 0 else 0
+    for i in range(1, len(seq_sorted)):
+        for depth in range(1, seq_len):
+            if seq_sorted[i - 1][:depth] != seq_sorted[i][:depth]:
+                prefix_boundaries.append((i, depth))
+                break
+
+    first_token_centers = []
+    first_token_names = []
+    start = 0
+    for i in range(1, len(seq_sorted) + 1):
+        at_end = i == len(seq_sorted)
+        if at_end or seq_sorted[i - 1][:1] != seq_sorted[i][:1]:
+            first_token_centers.append((start + i - 1) / 2.0)
+            first_token_names.append(seq_sorted[start][:1])
+            start = i
+
+    T = hidden.shape[0]
+    fig, axes = plt.subplots(1, 4, figsize=(3*T+1, 3))
+    
+    for t in range(T):
+        h = hidden[t][sort_idx]
+        norms = np.linalg.norm(h, axis=1, keepdims=True)
+        norms = np.maximum(norms, 1e-12)
+        cosine_sim = (h @ h.T) / (norms @ norms.T)
+        cosine_sim = np.clip(cosine_sim, -1.0, 1.0)
+        ax = axes[t]
+        im = ax.imshow(cosine_sim, cmap='viridis', vmin=0,
+            vmax=1.0, interpolation='nearest', aspect='equal')
+
+        if t == 0:
+            # t=1 和 t=4：只标 a/b/c/d
+            tick_pos = first_token_centers
+            tick_label = first_token_names
+
+        else:
+            # t=2 或 t=3：展开 A 组
+            prefix_len = t + 1
+
+            tick_pos = []
+            tick_label = []
+
+            # A组：按前 prefix_len 个字符分组
+            a_idx = np.where(np.char.startswith(seq_sorted, "a"))[0]
+            a_seq = seq_sorted[a_idx]
+
+            start = 0
+            current = a_seq[0][:prefix_len]
+
+            for i in range(1, len(a_seq) + 1):
+                at_end = (i == len(a_seq))
+                if at_end or a_seq[i][:prefix_len] != current:
+                    tick_pos.append((a_idx[start] + a_idx[i - 1]) / 2.0)
+                    tick_label.append(current)
+                    if not at_end:
+                        start = i
+                        current = a_seq[i][:prefix_len]
+        
+        ax.set_title(f"$t={t+1}$")
+        ax.set_xticks(first_token_centers)
+        ax.set_yticks(tick_pos)
+        ax.set_xticklabels(first_token_names, fontsize=10)
+        ax.set_yticklabels(tick_label, fontsize=10)
+
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label='Cosine similarity')
+    fig.tight_layout()
+    fig.savefig(os.path.join(save_dir, 'cosine_similarity.svg'), dpi=200)
+    plt.close(fig)
+
+
+
+def confusion_matrices(pred, target, n_classes=None, labels=None,cmap='cividis'):
+
+    # convert to numpy (ensure ints)
+    if hasattr(pred, 'cpu'):
+        pred_np = pred.detach().cpu().numpy()
+    else:
+        pred_np = np.array(pred)
+    if hasattr(target, 'cpu'):
+        target_np = target.detach().cpu().numpy()
+    else:
+        target_np = np.array(target)
+
+    pred_np = pred_np.astype(int)
+    target_np = target_np.astype(int)
+
+    # flatten over time and batch to aggregate counts
+    if pred_np.ndim == 1:
+        y_pred_all = pred_np
+        y_true_all = target_np
+    else:
+        y_pred_all = pred_np.reshape(-1)
+        y_true_all = target_np.reshape(-1)
+
+    labels = list(labels) if labels is not None else list(range(n_classes))
+
+    counts = np.zeros((n_classes, n_classes), dtype=int)
+    for yt, yp in zip(y_true_all, y_pred_all):
+        counts[int(yt), int(yp)] += 1
+
+    # Convert to proportions per true class (row-normalized) in [0,1]
+    counts_f = counts.astype(float)
+    row_sums = counts_f.sum(axis=1, keepdims=True)
+    # avoid div-by-zero
+    row_sums[row_sums == 0] = 1.0
+    props = counts_f / row_sums
+
+    save_path = os.path.join(SAVE_DIR, 'confusion_matrix.svg')
+
+    print("Confusion matrix:")
+    fig, ax = plt.subplots(figsize=(3.2, 3))
+    print("Counts:")
+    im = ax.imshow(props, interpolation='nearest', cmap=cmap, aspect='equal', vmin=0.0, vmax=1.0)
+    
+    Cdim = props.shape[0]
+    for r in range(Cdim):
+        for c in range(Cdim):
+            val = props[r, c]
+            txt = f'{val:.2f}' if val > 0 else ''
+            color = 'white' if val < 0.7 else 'gray'
+            ax.text(c, r, txt, ha='center', va='center', color=color, fontsize=8)
+    
+    ax.set_xticks(range(len(labels)))
+    ax.set_xticklabels(labels, rotation=0, fontsize=PLOT_FONT)
+    ax.set_yticks(range(len(labels)))
+    ax.set_yticklabels(labels, fontsize=PLOT_FONT)
+    ax.set_xlabel('Reconstructed', fontsize=PLOT_FONT)
+    ax.set_ylabel('True', fontsize=PLOT_FONT)
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=200)
+    plt.close(fig)
+
+
+
+def train(model, X_train, X_test, n_epochs=300, lr=0.001, weight_decay=1e-3, print_final=True):
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+    history = {k: [] for k in ['train_loss', 'test_loss', 'train_acc', 'test_acc']}
+ 
+    for epoch in range(n_epochs):
+        model.train()
+        optimizer.zero_grad()
+
+        X_batch = X_train
+        hidden, output = model(X_batch)
+
+        ce_loss = F.cross_entropy(
+            output.reshape(-1, output.shape[-1]),
+            torch.argmax(X_batch, dim=-1).reshape(-1)
+        )
+        total_loss = ce_loss
+
+        total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+
+        # evaluation
+        with torch.no_grad():
+            pred_train = torch.argmax(output, dim=-1)
+            target_train = torch.argmax(X_batch, dim=-1)
+            train_acc = (pred_train == target_train).all(dim=0).float().mean().item()
+
+        model.eval()
+        with torch.no_grad():
+            _, test_output = model(X_test)
+
+            test_ce_loss = F.cross_entropy(
+                test_output.reshape(-1, test_output.shape[-1]),
+                torch.argmax(X_test, dim=-1).reshape(-1)
+            )
+            test_loss = test_ce_loss
+
+            pred_test = torch.argmax(test_output, dim=-1)
+            target_test = torch.argmax(X_test, dim=-1)
+            test_acc = (pred_test == target_test).all(dim=0).float().mean().item()
+
+        # history - only save final epoch values to reduce memory
+        if epoch == n_epochs - 1:
+            history['train_loss'].append(total_loss.item())
+            history['test_loss'].append(float(test_loss))
+            history['train_acc'].append(train_acc)
+            history['test_acc'].append(test_acc)
+
+        
+        # Print at the final epoch when enabled.
+        if print_final and epoch == n_epochs - 1:
+            print(f"\nEpoch {epoch+1}/{n_epochs}:")
+            print(f"  Train - Loss: {total_loss.item():.4f}, Acc: {train_acc:.4f}")
+            print(f"  Test  - Loss: {test_loss.item():.4f}, Acc: {test_acc:.4f}")
+
+    return history
+
+
+def compute_metrics(train_metrics, test_metrics, latent_test, test_labels, types):
+    print('\n' + '='*60)
+    print('='*60)
+    print(f"Train acc: {train_metrics['acc']:.4f}")
+    print(f"Test acc: {test_metrics['acc']:.4f}")
+
+
+def run_experiment():
+    set_seed(seed)
+
+    # use single RNN model for experiments
+    model = RNN(alpha, d_hidden, L, alpha, output_activation='softmax').to(device)
+
+    seq_train, seq_test, labels_train, labels_test, types = generate_instances(alpha, L, m, frac_train=0.8)
+    X_train = sequences_to_tensor(seq_train, alpha).to(device)
+    X_test = sequences_to_tensor(seq_test, alpha).to(device)
+
+    history = train(model, X_train, X_test, n_epochs=epochs, lr=lr, weight_decay=weight_decay)
+
+    
+    # confusion matrices
+    # with torch.no_grad():
+    #     _, _, train_output = model(X_train)
+    #     pred_train = torch.argmax(train_output, dim=-1)
+    #     target_train = torch.argmax(X_train, dim=-1)
+    # confusion_matrices(pred_train, target_train, n_classes=alpha, labels=list(string.ascii_lowercase[:alpha]))
+    
+    # plotting
+    cosine_similarity(model, X_test, labels_test, types, save_dir=SAVE_DIR)
+    # pca_h_t(model, X_test, labels_test, types, seq_train=seq_train, save_dir=SAVE_DIR)
+
+
+    # final evaluation
+    model.eval()
+    with torch.no_grad():
+        z_test, test_output = model(X_test)
+        pred_test = torch.argmax(test_output, dim=-1)
+        target_test = torch.argmax(X_test, dim=-1)
+        test_acc = (pred_test == target_test).all(dim=0).float().mean().item()
+
+    train_acc = history['train_acc'][-1] if len(history['train_acc']) > 0 else 0.0
+    train_metrics = {'acc': train_acc}
+    test_metrics = {'acc': test_acc}
+
+    compute_metrics(train_metrics, test_metrics, z_test, labels_test, types)
+
+if __name__ == '__main__':
+    run_experiment()

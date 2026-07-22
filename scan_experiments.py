@@ -12,7 +12,7 @@ from matplotlib.colors import Normalize
 import glob
 
 from model import RNNAutoencoder
-from test import (
+from test_autoencoder import (
     SAVE_DIR,
     device,
     d_latent,

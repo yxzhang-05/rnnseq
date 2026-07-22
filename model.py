@@ -2,6 +2,8 @@
 RNN network
 '''
 
+from turtle import delay
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -432,8 +434,7 @@ class RNN (nn.Module):
 
         output = self.h2o(hidden[-1])
         output = output.view(-1, self.L, self.d_output)         # [B, T, D]
-        output = output.permute(1, 0, 2)                          # [T, B, D]
-        # print('outputshape', np.shape(output))
+        output = output.permute(1, 0, 2)    
 
         return hidden, output
 
@@ -473,26 +474,26 @@ class RNNEncoder(nn.Module):
         self.rnn = RNN(d_input, d_hidden, num_layers, d_latent, nonlinearity=nonlinearity, device=device,
             model_filename=model_filename, from_file=from_file,
             to_freeze=to_freeze, init_weights=init_weights, layer_type=layer_type)
-
+    
     def forward(self, x, delay=0):
         # x: (sequence_length, batch_size, d_input) 
         # output: (sequence_length, batch_size, d_hidden)
         # h: (num_layers, batch_size, d_hidden)
-        rnn_out, latent = self.rnn(x, delay=delay)
+        hidden, output = self.rnn(x, delay=delay)
+        latent = output
         # return activity of latent layer at end of sequence
         # latent = F.relu(latent)
-        return rnn_out, latent
+        return hidden, latent
 
 class RNNDecoder(nn.Module):
     def __init__(self, d_latent, d_hidden, num_layers, d_input, nonlinearity, device,
             init_weights, layer_type, sequence_length):
         super(RNNDecoder, self).__init__()
         # RNN: d_latent -> d_input
-
+        self.sequence_length = sequence_length
         self.rnn = RNN(d_latent, d_hidden, num_layers, d_input, nonlinearity=nonlinearity, device=device,
             init_weights=init_weights, layer_type=layer_type)
-        
-        self.sequence_length = sequence_length
+
 
     def forward(self, latent, delay=0):
         '''
@@ -504,7 +505,7 @@ class RNNDecoder(nn.Module):
         # filled_tensor = torch.zeros_like(latent_expanded)
         # filled_tensor[0,:] = latent
 
-        rnn_out, output = self.rnn(latent, delay=0)
+        hidden, output = self.rnn(latent, delay=delay)
         return output
 
 class RNNAutoencoder(nn.Module):
@@ -550,6 +551,7 @@ class RNNAutoencoder(nn.Module):
             _masking = lambda h: h
 
         # hidden is the output sequence, latent = hidden[-1]
-        hidden, latent = self.encoder(x, delay=self.delay)
-        reconstructed = self.decoder(latent)
-        return hidden, latent, reconstructed
+        hidden, latent = self.encoder(x, delay=delay)
+        reconstruction = self.decoder(latent)
+
+        return hidden, latent, reconstruction
